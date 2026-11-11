@@ -1,0 +1,4 @@
+- insert:
+    - id: composer-lists
+      name: dsh-composer-lists
+      config: {}

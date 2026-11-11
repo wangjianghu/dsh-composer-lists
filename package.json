@@ -1,0 +1,41 @@
+{
+  "name": "dsh-composer-lists",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Ordered and unordered list editing in the DeepSeek Harness message composer: auto numbering and renumbering, marker-aware caret moves, level promotion, and an AI prompt-polish button.",
+  "author": "wangjianghu",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wangjianghu/dsh-composer-lists.git"
+  },
+  "homepage": "https://github.com/wangjianghu/dsh-composer-lists#readme",
+  "bugs": {
+    "url": "https://github.com/wangjianghu/dsh-composer-lists/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "composer",
+    "list",
+    "markdown",
+    "ui"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md", "LICENSE"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+    }
+  }
+}

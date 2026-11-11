@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Composer lists",
+    "description": "Automatic list editing in the message composer: Shift+Enter continues ordered and unordered lists, Tab indents levels, and numbers renumber themselves."
+  }
+}
