@@ -68,6 +68,7 @@ bench('renumberPlan cold 500 lines (all markers off)', buildMixed(500), (t) => P
 
 // Gesture planners on a large selection.
 bench('togglePlan 500 lines', buildList(500), (t) => P.togglePlan(t, 0, 499, 'ordered', SETTINGS), 200)
+bench('togglePlan caret-mode 500 lines', buildList(500), (t) => P.togglePlan(t, 250, 250, 'ordered', SETTINGS, 4000), 200)
 bench('indentPlan 500 lines', buildList(500), (t) => P.indentPlan(t, 0, 499, 1, SETTINGS), 200)
 bench('indentPlan caret-mode 500 lines', buildList(500), (t) => P.indentPlan(t, 250, 250, 1, SETTINGS, 4000), 200)
 bench('arrowJump 500 lines', buildList(500), (t) => P.arrowJump(t, 4000, -1), 200)

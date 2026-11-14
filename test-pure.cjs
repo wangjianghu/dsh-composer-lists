@@ -142,13 +142,97 @@ eq(P.backspacePlan('1. abc', 5, SETTINGS).consume, false, 'backspace mid-content
 eq(P.backspacePlan('plain', 3, SETTINGS).consume, false, 'backspace plain native')
 
 // --- togglePlan: level styles + on/off cycling ---
-eq(apply('a\nb', P.togglePlan('a\nb', 0, 1, 'ordered', SETTINGS)), '1. a\n2. b', 'toggle ordered on L1')
-eq(apply('1. a\n2. b', P.togglePlan('1. a\n2. b', 0, 1, 'ordered', SETTINGS)), 'a\nb', 'toggle ordered off')
-eq(apply('a\n  b', P.togglePlan('a\n  b', 0, 1, 'ordered', SETTINGS)), '1. a\n  a. b', 'toggle ordered per level')
-eq(apply('x', P.togglePlan('x', 0, 0, 'bullet', SETTINGS)), '- x', 'toggle bullet on')
-eq(apply('- x', P.togglePlan('- x', 0, 0, 'bullet', SETTINGS)), 'x', 'toggle bullet off')
-eq(apply('* x', P.togglePlan('* x', 0, 0, 'bullet', SETTINGS)), 'x', 'toggle any bullet off')
-eq(apply('1. x', P.togglePlan('1. x', 0, 0, 'bullet', SETTINGS)), '- x', 'ordered to bullet')
+eq(apply('a\nb', P.togglePlan('a\nb', 0, 1, 'ordered', SETTINGS).plan), '1. a\n2. b', 'toggle ordered on L1')
+eq(apply('1. a\n2. b', P.togglePlan('1. a\n2. b', 0, 1, 'ordered', SETTINGS).plan), 'a\nb', 'toggle ordered off')
+eq(apply('a\n  b', P.togglePlan('a\n  b', 0, 1, 'ordered', SETTINGS).plan), '1. a\n  a. b', 'toggle ordered per level')
+eq(apply('x', P.togglePlan('x', 0, 0, 'bullet', SETTINGS).plan), '- x', 'toggle bullet on')
+eq(apply('- x', P.togglePlan('- x', 0, 0, 'bullet', SETTINGS).plan), 'x', 'toggle bullet off')
+eq(apply('* x', P.togglePlan('* x', 0, 0, 'bullet', SETTINGS).plan), 'x', 'toggle any bullet off')
+eq(apply('1. x', P.togglePlan('1. x', 0, 0, 'bullet', SETTINGS).plan), '- x', 'ordered to bullet')
+
+// --- togglePlan with a caret: the caret keeps its content offset ---
+{
+  // 'hello| world' → ordered: the plan replaces up to the caret and its
+  // text ends at the caret's content offset (plan.start + plan.text.length
+  // is where insertText parks the caret — the same content character).
+  const text = 'hello world'
+  const { pre, plan } = P.togglePlan(text, 0, 0, 'ordered', SETTINGS, 5)
+  eq(pre, null, 'caret toggle: no pre edit when nothing trails')
+  eq(apply(text, plan), '1. hello world', 'caret toggle ordered: text')
+  eq(plan.end, 5, 'caret toggle: replacement ends at the caret')
+  eq(plan.start + plan.text.length, 8, 'caret toggle: caret after "hello" (same character)')
+}
+{
+  // The reported repro: press the toggle shortcuts repeatedly; the caret
+  // must keep its content offset through the whole on/off cycle.
+  let text = 'hello world'
+  let caret = 5 // right after 'hello'
+  const step = (kind) => {
+    const { pre, plan } = P.togglePlan(text, 0, 0, kind, SETTINGS, caret)
+    eq(pre, null, 'cycle: single edit each press')
+    text = apply(text, plan)
+    caret = plan.start + plan.text.length
+  }
+  step('ordered')
+  eq(text, '1. hello world', 'cycle 1: ordered on')
+  eq(caret, 8, 'cycle 1: caret keeps content offset')
+  step('bullet')
+  eq(text, '- hello world', 'cycle 2: ordered → bullet')
+  eq(caret, 7, 'cycle 2: caret keeps content offset')
+  step('bullet')
+  eq(text, 'hello world', 'cycle 3: bullet off')
+  eq(caret, 5, 'cycle 3: caret back on the original character')
+  step('bullet')
+  eq(text, '- hello world', 'cycle 4: bullet on')
+  eq(caret, 7, 'cycle 4: caret keeps content offset')
+}
+{
+  // Caret inside the marker/indent clamps to the new marker end.
+  const { plan } = P.togglePlan('1. abc', 0, 0, 'bullet', SETTINGS, 2)
+  eq(apply('1. abc', plan), '- abc', 'caret inside marker: converts')
+  eq(plan.start + plan.text.length, 2, 'caret inside marker: parks after new marker')
+}
+{
+  // Toggle under an existing ordered block: the number continues (3.) in
+  // the SAME edit — the auto-renumber reaction would otherwise re-edit the
+  // draft and drag the caret to its own replacement end.
+  const text = '1. a\n2. b\nx'
+  const { pre, plan } = P.togglePlan(text, 2, 2, 'ordered', SETTINGS, 11)
+  eq(pre, null, 'toggle under list: single edit')
+  eq(apply(text, plan), '1. a\n2. b\n3. x', 'toggle under list: numbering continues')
+  eq(plan.start + plan.text.length, 14, 'toggle under list: caret stays at line end')
+  eq(P.renumberPlan(apply(text, plan), SETTINGS), null, 'toggle under list: reaction has nothing left')
+}
+{
+  // Toggling beside a suspended hand-written single item merges it into
+  // the block: the plan reaches back over the predecessor line, the caret
+  // target is unaffected.
+  const text = 'a. x\nz'
+  const { pre, plan } = P.togglePlan(text, 1, 1, 'ordered', SETTINGS, 6)
+  eq(pre, null, 'predecessor merge: single edit')
+  eq(apply(text, plan), '1. x\n2. z', 'predecessor merges and renumbers')
+  eq(plan.start + plan.text.length, 9, 'predecessor merge: caret at line end')
+}
+{
+  // Toggling OFF mid-block splits the list: the two-item tail renumbers
+  // through `pre` (applied first), keeping the caret on its line.
+  const text = '1. a\n2. b\n3. c\n4. d'
+  const { pre, plan } = P.togglePlan(text, 1, 1, 'ordered', SETTINGS, 8)
+  ok(pre !== null, 'tail renumber goes through pre')
+  eq(apply(apply(text, pre), plan), '1. a\nb\n1. c\n2. d', 'tail renumbers to 1., 2.')
+  eq(plan.start + plan.text.length, 5, 'tail: caret lands after "b"')
+  ok(pre.start >= plan.end, 'tail: pre edits after the caret span')
+}
+{
+  // Inserting an item BETWEEN two ordered items: the later sibling shifts
+  // through `pre`, the caret keeps its offset on the inserted line.
+  const text = '1. a\nx\n2. b'
+  const { pre, plan } = P.togglePlan(text, 1, 1, 'ordered', SETTINGS, 6)
+  ok(pre !== null, 'between items: later sibling shifts via pre')
+  eq(apply(apply(text, pre), plan), '1. a\n2. x\n3. b', 'between items: full block renumbers')
+  eq(plan.start + plan.text.length, 9, 'between items: caret after "x"')
+  eq(P.renumberPlan(apply(apply(text, pre), plan), SETTINGS), null, 'between items: reaction idle')
+}
 
 // --- indentPlan: level styles follow the shift ---
 eq(apply('1. a', P.indentPlan('1. a', 0, 0, 1, SETTINGS)), '  a. a', 'indent demotes to L2 letter')
@@ -210,7 +294,8 @@ eq(P.arrowJump('(12) x', 5, -1), 0, '← hop over paren marker')
 
 // --- marker-scope plans: replacement ends at the marker, not the line end ---
 {
-  const plan = P.togglePlan('task text here', 0, 0, 'bullet', SETTINGS)
+  const { pre, plan } = P.togglePlan('task text here', 0, 0, 'bullet', SETTINGS)
+  eq(pre, null, 'toggle plain: no pre edit')
   eq({ start: plan.start, end: plan.end, text: plan.text }, { start: 0, end: 0, text: '- ' }, 'toggle plain replaces only the prefix')
 }
 {
@@ -347,12 +432,12 @@ eq(P.backspacePlan('1. a\n2. ', 8, SETTINGS).mode, 'exit', 'empty L1 item still 
 }
 
 // --- togglePlan: mixed selections, empty lines, subsets ---
-eq(apply('1. a\n- b', P.togglePlan('1. a\n- b', 0, 1, 'ordered', SETTINGS)), '1. a\n2. b', 'mixed to ordered')
-eq(apply('x\n- y', P.togglePlan('x\n- y', 0, 1, 'ordered', SETTINGS)), '1. x\n2. y', 'plain and bullet to ordered')
-eq(apply('', P.togglePlan('', 0, 0, 'ordered', SETTINGS)), '1. ', 'toggle on empty draft starts a list')
-eq(apply('1. a\n2. b\n3. c', P.togglePlan('1. a\n2. b\n3. c', 1, 2, 'bullet', SETTINGS)), '1. a\n- b\n- c', 'toggle subset keeps other lines')
-eq(apply('a. x\nb. y', P.togglePlan('a. x\nb. y', 0, 1, 'ordered', SETTINGS)), 'x\ny', 'any ordered kind toggles off')
-eq(apply('  x', P.togglePlan('  x', 0, 0, 'bullet', SETTINGS)), '  * x', 'toggle keeps existing indent')
+eq(apply('1. a\n- b', P.togglePlan('1. a\n- b', 0, 1, 'ordered', SETTINGS).plan), '1. a\n2. b', 'mixed to ordered')
+eq(apply('x\n- y', P.togglePlan('x\n- y', 0, 1, 'ordered', SETTINGS).plan), '1. x\n2. y', 'plain and bullet to ordered')
+eq(apply('', P.togglePlan('', 0, 0, 'ordered', SETTINGS).plan), '1. ', 'toggle on empty draft starts a list')
+eq(apply('1. a\n2. b\n3. c', P.togglePlan('1. a\n2. b\n3. c', 1, 2, 'bullet', SETTINGS).plan), '1. a\n- b\n- c', 'toggle subset keeps other lines')
+eq(apply('a. x\nb. y', P.togglePlan('a. x\nb. y', 0, 1, 'ordered', SETTINGS).plan), 'x\ny', 'any ordered kind toggles off')
+eq(apply('  x', P.togglePlan('  x', 0, 0, 'bullet', SETTINGS).plan), '  * x', 'toggle keeps existing indent')
 
 // --- indentPlan: level clamps and no-op guard ---
 eq(apply('      1. x', P.indentPlan('      1. x', 0, 0, -1, SETTINGS)), '    ① x', 'outdent L3 restyles to L2 circle')
@@ -416,7 +501,16 @@ for (const text of ['1. a\n1. a\n1. a', '1. a\n  9. b\n    5. c\n2. d', 'a. x\nb
     try {
       const r0 = P.renumberPlan(text, SETTINGS)
       validPlan(text, r0, `fuzz renumber #${n}`)
-      validPlan(text, P.togglePlan(text, lo, hi, kind, SETTINGS), `fuzz toggle #${n}`)
+      // Toggle (selection mode or collapsed-caret mode): both plans are
+      // in-bounds, pre edits strictly after the caret span, and the final
+      // draft is already renumber-converged (the reaction — whose
+      // insertText would move the caret — stays idle).
+      const tp = P.togglePlan(text, lo, hi, kind, SETTINGS, rnd() < 0.5 ? undefined : caret)
+      validPlan(text, tp.pre, `fuzz toggle pre #${n}`)
+      validPlan(text, tp.plan, `fuzz toggle #${n}`)
+      if (tp.pre !== null) ok(tp.pre.start >= tp.plan.end, `fuzz toggle pre-after-plan #${n}`)
+      const toggled = tp.pre === null ? apply(text, tp.plan) : apply(apply(text, tp.pre), tp.plan)
+      ok(P.renumberPlan(toggled, SETTINGS) === null, `fuzz toggle reaction-idle #${n}`)
       validPlan(text, P.indentPlan(text, lo, hi, dir, SETTINGS), `fuzz indent #${n}`)
       const cp = P.continuationPlan(text, caret, caret, SETTINGS)
       validPlan(text, cp.plan, `fuzz continue #${n}`)

@@ -12,6 +12,10 @@
  *   Tab / Shift+Tab  → on list lines only: indent / outdent one level
  *   Cmd/Ctrl+Shift+8 → toggle unordered list on the caret line / selection
  *   Cmd/Ctrl+Shift+7 → toggle ordered list on the caret line / selection
+ *                      (a collapsed caret keeps its content offset; the
+ *                      renumbering the toggle implies on the surrounding
+ *                      block folds into the same edit, so the auto-renumber
+ *                      reaction never moves the caret afterwards)
  *
  * Ordered numbers are renumbered automatically after deletions or pastes.
  * Keyboard-only by design: the runtime renders no UI (a null component
@@ -313,12 +317,25 @@ window.__ModuleLoader__.load({
     /**
      * Toggle a list kind over the line range [a, b]: every line already of
      * that kind turns it off; otherwise lines convert, using each level's
-     * configured style. Pressing repeatedly cycles on/off. The replacement
-     * covers only marker prefixes so the caret lands right after the marker.
+     * configured style. Pressing repeatedly cycles on/off.
+     *
+     * The conversion is then converged to the auto-renumber state (numbers
+     * continue across the surrounding block, later siblings shift) inside
+     * THIS edit: the renumber reaction's own insertText would park the
+     * caret at ITS replacement end, dragging it away from the caret line.
+     * With a collapsed `caret` the plan ends exactly at the caret's content
+     * offset, so insertText parks it on the same content character (the
+     * Tab/Shift+Tab treatment); marker rewrites the convergence needs
+     * strictly AFTER the caret line are split into `pre`, which the caller
+     * applies first so the caret edit goes last. Rewrites BEFORE the caret
+     * line fold into the plan itself — its span may start earlier, the
+     * caret target is unaffected.
      * @param {'bullet'|'ordered'} kind
-     * @returns {null|{start:number,end:number,text:string}}
+     * @param {number} [caret] collapsed caret offset in `text` coordinates
+     * @returns {{pre:{start:number,end:number,text:string}|null,
+     *   plan:{start:number,end:number,text:string}}}
      */
-    function togglePlan (text, a, b, kind, settings) {
+    function togglePlan (text, a, b, kind, settings, caret) {
       const unit = settings.indentUnit
       const lines = text.split('\n')
       const last = Math.min(b, lines.length - 1)
@@ -351,7 +368,43 @@ window.__ModuleLoader__.load({
           out[k] = withMarker(lines[k], renderOrderedCore(settings.orderedStyles[level], counters.get(lead)))
         }
       }
-      return markerScopePlan(text, a, last, out)
+      // Converge to what the auto-renumber reaction would settle on; doing
+      // it here keeps the reaction idle after the edit.
+      const norm = renumberLines(out, 0, out.length - 1, settings, false).out
+      let from = a
+      for (let k = 0; k < a; k += 1) {
+        if (norm[k] !== lines[k]) { from = k; break }
+      }
+      let firstTrail = -1
+      let lastTrail = -1
+      for (let k = last + 1; k < lines.length; k += 1) {
+        if (norm[k] !== lines[k]) {
+          if (firstTrail < 0) firstTrail = k
+          lastTrail = k
+        }
+      }
+      if (caret === undefined) {
+        // Selection: one marker-scope replacement reaching back/forward to
+        // every line the convergence touched; the caret parks after the
+        // final marker as before.
+        return { pre: null, plan: markerScopePlan(text, from, Math.max(last, lastTrail), norm) }
+      }
+      const lastStart = lineRange(text, last, last).start
+      const lastEnd = lineRange(text, last, last).end
+      // The handler always passes a caret on line `last`; clamp anyway so
+      // an off-line caret can never pull the '\n' past the line end into
+      // the replacement (which would overlap `pre`).
+      const caretOnLine = Math.min(Math.max(caret, lastStart), lastEnd)
+      const oldEnd = lastStart + markerEndOf(lines[last])
+      const contentOffset = Math.max(0, caretOnLine - oldEnd)
+      const newEnd = markerEndOf(norm[last])
+      const pieces = []
+      for (let k = from; k < last; k++) pieces.push(norm[k])
+      pieces.push(norm[last].slice(0, Math.min(norm[last].length, newEnd + contentOffset)))
+      return {
+        pre: firstTrail >= 0 ? markerScopePlan(text, firstTrail, lastTrail, norm) : null,
+        plan: { start: lineRange(text, from, from).start, end: Math.max(caretOnLine, oldEnd), text: pieces.join('\n') },
+      }
     }
 
     /**
@@ -946,7 +999,19 @@ window.__ModuleLoader__.load({
             const sel = selectionLines(editable)
             if (sel === null) return
             const kind = e.code === 'Digit7' || e.code === 'Numpad7' ? 'ordered' : 'bullet'
-            if (!applyPlan(togglePlan(sel.text, sel.a, sel.b, kind, settingsRef.current), editable)) return
+            // Collapsed caret: the plan ends at the caret's content offset,
+            // so the toggle parks it on the same content character.
+            const caret = sel.collapsed ? Math.max(sel.span.start, sel.span.end) : undefined
+            const { pre, plan } = togglePlan(sel.text, sel.a, sel.b, kind, settingsRef.current, caret)
+            // Renumbering past the caret line goes FIRST — the caret edit
+            // must be the last insertText, which is where the caret parks.
+            const preApplied = pre !== null && applyPlan(pre, editable)
+            if (!applyPlan(plan, editable)) {
+              if (!preApplied) return // edit refused: keep the native key
+              e.preventDefault()
+              e.stopPropagation()
+              return
+            }
             e.preventDefault()
             e.stopPropagation()
             return
@@ -1371,7 +1436,7 @@ window.__ModuleLoader__.load({
 }
 .clp-popover {
   position: fixed; z-index: 2147483000; width: 340px; height: min(432px, calc(100vh - 24px));
-  overflow: auto; padding: 10px 12px 10px; box-sizing: border-box;
+  overflow: hidden; padding: 10px 12px 10px; box-sizing: border-box;
   background: var(--dsw-alias-bg-overlay); color: var(--dsw-alias-label-primary);
   border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px;
   box-shadow: 0 8px 28px rgba(0,0,0,.22);
@@ -1393,7 +1458,12 @@ window.__ModuleLoader__.load({
 }
 .clp-tab + .clp-tab { border-left: 1px solid var(--dsw-alias-border-l1); }
 .clp-tab-on { background: var(--dsw-alias-brand-primary); color: #fff; font-weight: 600; }
-.clp-tab-body { display: flex; flex-direction: column; gap: 8px; }
+/* The popover shell never scrolls; the title and the tab bar stay pinned
+   and only this body scrolls (min-height:0 lets the flex child shrink). */
+.clp-tab-body {
+  display: flex; flex-direction: column; gap: 8px;
+  overflow-y: auto; min-height: 0; overscroll-behavior: contain;
+}
 .clp-keys-head { display: flex; align-items: baseline; gap: 8px; padding-top: 2px; }
 .clp-keys-title { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
 .clp-keys-scope { color: var(--dsw-alias-label-secondary); font-size: 11px; }

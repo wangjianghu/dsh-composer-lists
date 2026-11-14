@@ -1,6 +1,6 @@
 {
   "name": "dsh-composer-lists",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "description": "Ordered and unordered list editing in the DeepSeek Harness message composer: auto numbering and renumbering, marker-aware caret moves, level promotion, and an AI prompt-polish button.",
   "author": "wangjianghu",
