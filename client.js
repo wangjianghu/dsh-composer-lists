@@ -1,5 +1,5 @@
 /**
- * dsh-composer-lists — browser half.
+ * @local/composer-lists — browser half.
  *
  * Automatic ordered/unordered list editing inside the DSH message composer,
  * following the composer's native keymap decisions:
@@ -8,7 +8,9 @@
  *   Cmd/Ctrl+Enter   → accelerated submit (native, untouched)
  *   Shift+Enter      → line break; when the caret line is a list item, the
  *                      new line continues the list (next number / same
- *                      bullet, same indent). An empty item exits the list.
+ *                      bullet, same indent). An empty item exits the list
+ *                      by de-marker-ing into an empty plain line, so a
+ *                      second break blanks a line after the list.
  *   Tab / Shift+Tab  → on list lines only: indent / outdent one level
  *   Cmd/Ctrl+Shift+8 → toggle unordered list on the caret line / selection
  *   Cmd/Ctrl+Shift+7 → toggle ordered list on the caret line / selection
@@ -29,7 +31,7 @@
  * hands-off (insertText would simply fail, but we prefer not to guess).
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-composer-lists',
+  id: '@local/composer-lists',
   factory (require) {
     const React = require('react')
     const { createElement: h, useState, useEffect, useRef, useCallback } = React
@@ -38,6 +40,9 @@ window.__ModuleLoader__.load({
     // ------------------------------------------------------------------
     // Pure list-text helpers (also exercised by tests via _pure below).
     // ------------------------------------------------------------------
+
+    /** Plugin version, mirrored into package.json — shown in the settings popover title. */
+    const PLUGIN_VERSION = '1.3.0'
 
     /** Ordered marker styles: arabic `1.`, letter `a.`, greek `α.`, paren `(1)`, circle `①`. */
     const ORDERED_STYLES = ['arabic', 'letter', 'greek', 'paren', 'circle']
@@ -471,22 +476,43 @@ window.__ModuleLoader__.load({
     /**
      * Shift+Enter plan for the caret line: continue the list with the next
      * marker of the same level, or — on an empty item — exit the list by
-     * removing the whole line and joining the caret to the previous line's
-     * end (no blank line left behind).
-     * @returns {{consume:boolean, plan:{start:number,end:number,text:string}|null}}
+     * stripping its marker and leaving an EMPTY PLAIN LINE in its place (the
+     * caret parks at that line's start). The next Shift+Enter then runs
+     * natively and opens a real blank line, so consecutive breaks after a
+     * numbered/bulleted line can space out a paragraph (further breaks keep
+     * blanking); only when the item is the draft's sole content does the
+     * exit clear the draft entirely.
+     * @returns {{consume:boolean, plan:{start:number,end:number,text:string}|null,
+     *   exited:boolean}}
      */
     function continuationPlan (text, caretStart, caretEnd, settings) {
+      caretStart = Math.max(0, Math.min(caretStart, text.length))
+      caretEnd = Math.max(0, Math.min(caretEnd, text.length))
       const { start: lineStart, end: lineEnd } = lineBounds(text, caretStart)
       const line = text.slice(lineStart, lineEnd)
       const it = parseItem(line)
-      if (it === null) return { consume: false, plan: null }
+      if (it === null) return { consume: false, plan: null, exited: false }
       if (it.emptyItem) {
-        const firstLine = lineStart === 0
-        const nextBreak = text.charAt(lineEnd) === '\n' ? lineEnd + 1 : lineEnd
-        const plan = firstLine
-          ? { start: 0, end: nextBreak, text: '' } // join the following line up
-          : { start: lineStart - 1, end: lineEnd, text: '' } // join into the previous line
-        return { consume: true, plan }
+        // Insertion-type exit, landing the caret BELOW one blank line:
+        // rewrite the PRECEDING newline plus the whole empty item — and
+        // any run of blank lines that FOLLOWS it — as '\n\n'. Collapsing
+        // the trailing blank run keeps the visual result identical to a
+        // fresh exit instead of stacking new blanks onto old ones, and the
+        // insertion's caret always parks at the end of the inserted text,
+        // where the host's selection remapping cannot misplace it. A
+        // selection extending past the blank run is replaced with it.
+        let end = lineEnd
+        while (text.charAt(end) === '\n') {
+          const nl = text.indexOf('\n', end + 1)
+          const nextEnd = nl < 0 ? text.length : nl
+          if (nextEnd > end + 1) break // next line carries content: stop at its boundary
+          end = nextEnd // swallow this blank line
+        }
+        end = Math.max(end, caretEnd)
+        const plan = lineStart === 0
+          ? { start: 0, end, text: '' } // first line: strip in place, collapsing its blank run too
+          : { start: lineStart - 1, end, text: '\n\n' }
+        return { consume: true, plan, exited: true }
       }
       // Continue with the current line's own style: the next marker feels
       // right even when the user hand-wrote a non-default style at this level.
@@ -494,7 +520,84 @@ window.__ModuleLoader__.load({
         ? renderOrderedCore(it.style, (it.num ?? 0) + 1)
         : it.bullet
       const insert = '\n' + it.indent + core + ' '
-      return { consume: true, plan: { start: caretStart, end: Math.max(caretEnd, caretStart), text: insert } }
+      return { consume: true, plan: { start: caretStart, end: Math.max(caretEnd, caretStart), text: insert }, exited: false }
+    }
+
+    /**
+     * Marker fix for the line that FOLLOWED an exited empty item: when that
+     * adjacent line was an ordered item and the exit leaves it as a
+     * single-item block whose number no longer starts the block (a lone
+     * "3. b" under the blank), rewrite it to the level's first marker.
+     * Content-driven renumbering skips single-item blocks by design (a lone
+     * hand-numbered line must stay untouched), so the exit path asks for
+     * this targeted fix itself. Computed on the PRE-edit text.
+     * @returns {null|{start:number,end:number,text:string}}
+     */
+    function exitTailFixPlan (text, caret, settings) {
+      const lines = text.split('\n')
+      const next = lineIndexOf(text, caret) + 1
+      const it = lines[next] === undefined ? null : parseItem(lines[next])
+      if (it === null || !it.ordered) return null
+      let e = next
+      while (e + 1 < lines.length && parseItem(lines[e + 1]) !== null) e += 1
+      if (e > next) return null // multi-item tail block: renumberPlan already covers it
+      const level = Math.min(LEVELS - 1, levelOf(it.indentLen, Math.max(2, settings.indentUnit)))
+      const core = renderOrderedCore(settings.orderedStyles[level], 1)
+      if (core === lines[next].slice(it.indentLen, it.coreLen)) return null
+      const out = lines.slice()
+      out[next] = it.indent + core + ' ' + it.rest.replace(/^[ \t]/, '')
+      return markerScopePlan(text, next, next, out)
+    }
+
+    /**
+     * Pure decision for ONE Shift+Enter press — the entire keydown-branch
+     * logic minus DOM plumbing and the renumber pre-run, so tests can drive
+     * whole user sequences. `dom` carries the two DOM probes the branch
+     * needs: `anchorBlockEmpty` (the caret's top-level block projects as
+     * empty) and `anchorTextAfterContent` (the caret anchors in a text
+     * node past its content, inside the previous line's block — the
+     * "user put me at the list line's end" signal).
+     * @returns {{kind:'insert', plan:{start:number,end:number,text:string},
+     *   exited:boolean, renum:boolean}|{kind:'native'}}
+     */
+    function seDecision (text, spanStart, spanEnd, dom, exitPending, settings) {
+      // Caret physically inside an EMPTY block: the user is visually on a
+      // blank line. The native break inside an empty paragraph does not
+      // accumulate a visible second blank line, and inserting '\n' at
+      // either side of the block gap is equivalent — grow it ourselves.
+      if (dom.anchorBlockEmpty) {
+        return {
+          kind: 'insert', renum: false, exited: false,
+          plan: { start: Math.min(spanStart, spanEnd), end: Math.max(spanStart, spanEnd), text: '\n' },
+        }
+      }
+      // Reverse gap disambiguation: a caret at the previous block's END
+      // right before an empty line can project onto that empty line's
+      // start; reattribute it to the previous line — EXCEPT right after
+      // our own exit edit (exitPending), while the consecutive-break
+      // blanking flow must keep going native-to-ourselves.
+      let caretStart = Math.min(spanStart, spanEnd)
+      const caretEnd = Math.max(spanStart, spanEnd)
+      if (spanStart === spanEnd && caretStart > 0 && text.charAt(caretStart - 1) === '\n') {
+        const probe = lineBounds(text, caretStart)
+        if (!exitPending && probe.start === caretStart && probe.end === caretStart && dom.anchorTextAfterContent) {
+          caretStart -= 1
+        }
+      }
+      const { consume, plan, exited } = continuationPlan(text, caretStart, caretEnd, settings)
+      if (consume) return { kind: 'insert', renum: true, exited, plan }
+      // Not a list interaction. On an EMPTY line the native break inserts
+      // TWO newlines at once next to existing breaks (observed
+      // "1. a\n" → "1. a\n\n\n"), jumping the caret two lines — grow the
+      // blank by exactly one ourselves.
+      const lb = lineBounds(text, caretStart)
+      if (lb.start === caretStart && lb.end === caretStart) {
+        return {
+          kind: 'insert', renum: false, exited: false,
+          plan: { start: Math.min(spanStart, spanEnd), end: Math.max(spanStart, spanEnd), text: '\n' },
+        }
+      }
+      return { kind: 'native' }
     }
 
     /**
@@ -590,10 +693,13 @@ window.__ModuleLoader__.load({
      * U+FFFC, and <br> is a line break.
      */
     function blockText (node) {
+      // A block whose ONLY content is one <br> — Lexical's empty-paragraph
+      // placeholder, whether the <br> sits at the top level or nested in a
+      // formatting span — projects as '' (the block gap already carries \n).
+      // Top-level and nested placeholders must agree or every line index
+      // built on the projection shifts by one.
+      if (node.textContent === '' && node.querySelectorAll('br').length === 1) return ''
       const kids = Array.from(node.childNodes)
-      // A block whose only child is <br> is Lexical's empty-paragraph
-      // placeholder: it projects as '' (the block gap already carries \n).
-      if (kids.length === 1 && kids[0].nodeName === 'BR') return ''
       let s = ''
       for (const ch of kids) {
         if (ch.nodeType === Node.TEXT_NODE) s += ch.data
@@ -649,6 +755,39 @@ window.__ModuleLoader__.load({
         return sel.anchorOffset === 0 && anchor.previousSibling === null
       }
       return sel.anchorOffset === 0
+    }
+
+    /**
+     * Index (into the editable's direct children) of the top-level block
+     * containing the collapsed DOM caret, or -1 when it cannot be located.
+     */
+    function domAnchorBlockIndex () {
+      const sel = window.getSelection()
+      if (sel === null || !sel.isCollapsed || sel.rangeCount === 0) return -1
+      const editable = editableState.current
+      if (editable === null) return -1
+      const anchor = sel.anchorNode
+      if (anchor === null) return -1
+      const blocks = Array.from(editable.children)
+      for (let i = 0; i < blocks.length; i += 1) {
+        if (blocks[i] === anchor || blocks[i].contains(anchor)) return i
+      }
+      return -1
+    }
+
+    /**
+     * Index of the top-level block that the (0-based) projected `lineIdx`
+     * of `text` lives in, walking the detect projection block by block.
+     */
+    function blockIndexOfLine (editable, text, lineIdx) {
+      const blocks = Array.from(editable.children)
+      let covered = 0
+      for (let b = 0; b < blocks.length; b += 1) {
+        const lines = blockText(blocks[b]).split('\n').length
+        if (lineIdx < covered + lines) return b
+        covered += lines
+      }
+      return -1
     }
 
     /** Whether the trigger candidate menu is open (its option rows carry these ids). */
@@ -823,6 +962,73 @@ window.__ModuleLoader__.load({
       // Keyboard: Shift+Enter continuation, Backspace marker deletion, Tab
       // indent, Cmd/Ctrl+Shift+7/8 — all on the live DOM text.
       useEffect(() => {
+        // True while the caret still rests where our own empty-item exit edit
+        // left it: the next Shift+Enter keeps blanking natively. Any user
+        // caret placement (pointer, arrows, typing) clears it so a caret
+        // deliberately moved to a list line's end continues the list again.
+        let exitPending = false
+        const exitPendingClearingKey = /^(Arrow(Left|Right|Up|Down)|Home|End|Page(Up|Down)|Backspace|Delete|Tab)$/
+        // Effect lifetime + pending caret-descent frame, cancelled on cleanup
+        // so a hot-reloaded/unmounted Runtime never touches the DOM again.
+        let disposed = false
+        let descentRaf = 0
+        // The composer is ONE paragraph whose line breaks are first literal
+        // '\n' text and later — after the host's normalization pass — <br>
+        // nodes; the selection the edit left behind maps to BEFORE the
+        // trailing <br>, i.e. the END of the list line (log-proven). The
+        // caret must only move DOWN through breaks, so after an exit edit:
+        // poll until normalization has produced the trailing <br> (or an
+        // empty following block appears), then move the caret past it and
+        // re-assert for a few frames against host selection restores. Stop
+        // as soon as the user takes over (exitPending cleared).
+        const queueCaretDescent = () => {
+          let tries = 0
+          const step = () => {
+            if (!exitPending || disposed || document.hidden || tries >= 20) return
+            tries += 1
+            const editable = currentEditable()
+            if (editable === null || !editable.isConnected) return
+            const anchorBlock = domAnchorBlockIndex()
+            if (anchorBlock < 0) { descentRaf = requestAnimationFrame(step); return }
+            const blocks = Array.from(editable.children)
+            const cur = blocks[anchorBlock]
+            if (cur === undefined) return
+            const curText = blockText(cur)
+            const next = blocks[anchorBlock + 1]
+            const sel = window.getSelection()
+            if (sel === null || !sel.isCollapsed || sel.rangeCount === 0) return
+            const target = document.createRange()
+            if (next !== undefined && blockText(next) === '') {
+              target.selectNodeContents(next)
+              target.collapse(true)
+            } else if (next === undefined && curText.endsWith('\n')) {
+              const brs = cur.querySelectorAll('br')
+              const br = brs.length > 0 ? brs[brs.length - 1] : null
+              if (br === null) {
+                // Normalization ('\n' text → <br>) has not run yet: wait.
+                descentRaf = requestAnimationFrame(step)
+                return
+              }
+              target.setStartAfter(br)
+              target.collapse(true)
+            } else {
+              return
+            }
+            const curRange = sel.getRangeAt(0)
+            if (curRange.compareBoundaryPoints(Range.END_TO_START, target) >= 0) {
+              // Already parked on the blank line; keep re-asserting a bit
+              // in case the host restores its own selection.
+              descentRaf = requestAnimationFrame(step)
+              return
+            }
+            sel.removeAllRanges()
+            sel.addRange(target)
+            descentRaf = requestAnimationFrame(step)
+          }
+          descentRaf = requestAnimationFrame(step)
+        }
+        // TEMPORARY diagnostics removed (v1.2.0): the exit-caret bug was
+        // located with per-Shift+Enter console logs and fixed.
         const onKey = (e) => {
           const state = inputRef.current
           const actions = actionsRef.current
@@ -831,6 +1037,11 @@ window.__ModuleLoader__.load({
           if (composing(e)) return
           const editable = editableFromTarget(e.target)
           if (editable === null) return
+          if (e.key !== 'Enter'
+            && (exitPendingClearingKey.test(e.key) || e.key.length === 1)) exitPending = false
+          // Submit (plain Enter) clears the draft: the stale exitPending
+          // must not leak into the next message's first Shift+Enter.
+          if (e.key === 'Enter' && !e.shiftKey) exitPending = false
           // While a prompt optimization is in flight the draft is frozen.
           // Escape is the one escape hatch: it aborts the in-flight request
           // so a hung model can never lock the composer for good.
@@ -853,27 +1064,79 @@ window.__ModuleLoader__.load({
             if (span === undefined) return
             const text = liveText(editable)
             if (text === null) return
-            const { consume, plan } = continuationPlan(text, Math.min(span.start, span.end), Math.max(span.start, span.end), settingsRef.current)
-            if (!consume) return
-            e.preventDefault()
-            e.stopPropagation()
-            // Pre-run the renumber the insertion will cause (mapped back into
-            // pre-insert coordinates), then insert LAST so the caret stays
-            // right after the new marker instead of at the renumbered tail.
+            // DOM probes fed to the pure per-press decision (seDecision):
+            // the caret's top-level block emptiness, and whether the caret
+            // anchors in a text node past content inside the previous
+            // line's block ("user placed me at the list line's end").
+            const anchorBlock = domAnchorBlockIndex()
+            const sel = window.getSelection()
+            const anchorTextAfterContent = sel !== null && sel.isCollapsed
+              && sel.anchorNode !== null
+              && sel.anchorNode.nodeType === Node.TEXT_NODE
+              && sel.anchorOffset > 0
+              && anchorBlock >= 0
+              && anchorBlock === blockIndexOfLine(editable, text, lineIndexOf(text, Math.min(span.start, span.end) - 1))
+            const decision = seDecision(text, span.start, span.end, {
+              anchorBlockEmpty: anchorBlock >= 0 && blockText(editable.children[anchorBlock]) === '',
+              anchorTextAfterContent,
+            }, exitPending, settingsRef.current)
+            if (decision.kind === 'native') return
+            const { plan, exited, renum: withRenum } = decision
+            if (!withRenum) {
+              // Blank-line growth: a bare '\n' with no renumbering.
+              const okBlank = actions.insertText(plan.text, {
+                start: plan.start, end: plan.end, draftRev: span.draftRev,
+              })
+              if (okBlank) {
+                e.preventDefault()
+                e.stopPropagation()
+              }
+              return
+            }
+            // Insert FIRST, preventDefault only once an edit landed — a
+            // refused edit (phase change / rev CAS) must never swallow the
+            // keypress.
+            // Pre-run the renumber the insertion will cause (mapped back
+            // into pre-insert coordinates), then insert LAST so the caret
+            // stays right after the new marker instead of at the renumbered
+            // tail. An exit additionally fixes a lone ordered tail item
+            // (single-item blocks are below renumberPlan's threshold).
             const afterText = text.slice(0, plan.start) + plan.text + text.slice(plan.end)
             const renum = renumberPlan(afterText, settingsRef.current)
-            if (renum !== null && renum.start >= plan.start + plan.text.length) {
+            const tail = exited ? exitTailFixPlan(text, Math.min(span.start, span.end), settingsRef.current) : null
+            const pre = renum !== null && renum.start >= plan.start + plan.text.length ? renum : tail
+            if (pre !== null) {
               const delta = plan.text.length - (plan.end - plan.start)
-              const applied = actions.insertText(renum.text, {
-                start: renum.start - delta, end: renum.end - delta, draftRev: span.draftRev,
+              // renum lives in POST-plan coordinates (mapped back by delta);
+              // tail was computed on the PRE-edit text and needs no shift.
+              const shifted = pre === tail ? pre : {
+                text: pre.text,
+                start: pre.start - delta,
+                end: pre.end - delta,
+              }
+              const applied = actions.insertText(shifted.text, {
+                start: shifted.start, end: shifted.end, draftRev: span.draftRev,
               })
               if (applied) {
+                e.preventDefault()
+                e.stopPropagation()
                 const span2 = actions.captureInsertion()
-                actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span2.draftRev })
+                if (span2 === undefined) {
+                  console.error('[composer-lists] caret span lost between edits; main edit skipped')
+                  return
+                }
+                exitPending = exited && actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span2.draftRev })
+                if (exitPending) queueCaretDescent()
                 return
               }
             }
-            actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span.draftRev })
+            const okPlain = actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span.draftRev })
+            if (okPlain) {
+              e.preventDefault()
+              e.stopPropagation()
+            }
+            exitPending = exited && okPlain
+            if (exitPending) queueCaretDescent()
             return
           }
           if (key === 'Backspace' && !e.altKey && !e.metaKey && !e.ctrlKey) {
@@ -884,14 +1147,19 @@ window.__ModuleLoader__.load({
             const { consume, plan: bsPlan, mode, fallback } = backspacePlan(text, span.start, settingsRef.current)
             let plan = bsPlan
             if (!consume) return
-            e.preventDefault()
-            e.stopPropagation()
+            // Insert FIRST, preventDefault only once an edit landed (see the
+            // Shift+Enter branch). Promote may fall back to the plain plan.
+            let consumed = false
             if (mode === 'promote') {
               // Level deletion: the plan already renormalizes the block up to
               // this line, and its marker scope drops the caret right after
               // the promoted marker on the same line. Later siblings renumber
               // through the auto-renumber reaction.
-              if (applyPlan(plan, editable)) return
+              if (applyPlan(plan, editable)) {
+                e.preventDefault()
+                e.stopPropagation()
+                return
+              }
               // The edit was refused (phase change / rev CAS): never swallow
               // the key — fall back to the plain marker deletion.
               console.error('[composer-lists] promote edit refused; falling back to plain marker deletion')
@@ -907,12 +1175,25 @@ window.__ModuleLoader__.load({
                 start: renum.start + delta, end: renum.end + delta, draftRev: span.draftRev,
               })
               if (applied) {
+                consumed = true
                 const span2 = actions.captureInsertion()
-                actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span2.draftRev })
+                if (span2 === undefined) {
+                  console.error('[composer-lists] caret span lost between edits; main edit skipped')
+                  return
+                }
+                const okMain = actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span2.draftRev })
+                if (okMain) {
+                  e.preventDefault()
+                  e.stopPropagation()
+                }
                 return
               }
             }
-            actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span.draftRev })
+            const okBs = actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span.draftRev })
+            if (okBs || consumed) {
+              e.preventDefault()
+              e.stopPropagation()
+            }
             return
           }
           if (accelerated(e) && e.shiftKey && !e.altKey && (key === 'b' || key === 'B')) {
@@ -922,8 +1203,6 @@ window.__ModuleLoader__.load({
             const span = actions.captureInsertion()
             const text = liveText(editable)
             if (span === undefined || text === null) return
-            e.preventDefault()
-            e.stopPropagation()
             const sel = text.slice(span.start, span.end)
             const plan = sel.length >= 4 && sel.startsWith('**') && sel.endsWith('**')
               ? { start: span.start, end: span.end, text: sel.slice(2, -2) }
@@ -932,7 +1211,10 @@ window.__ModuleLoader__.load({
                   end: span.end,
                   text: sel === '' ? `**${tRef.current('boldText')}**` : `**${sel}**`,
                 }
-            actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span.draftRev })
+            if (actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span.draftRev })) {
+              e.preventDefault()
+              e.stopPropagation()
+            }
             return
           }
           if ((key === 'ArrowLeft' || key === 'ArrowRight')
@@ -977,10 +1259,11 @@ window.__ModuleLoader__.load({
             const line = text.split('\n')[lineIdx]
             if (line === undefined || parseItem(line) === null) return
             if (caret - lineStart === markerEndOf(line)) return // already after the marker
-            e.preventDefault()
-            e.stopPropagation()
             const plan = markerScopePlan(text, lineIdx, lineIdx, text.split('\n'))
-            actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span.draftRev })
+            if (actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span.draftRev })) {
+              e.preventDefault()
+              e.stopPropagation()
+            }
             return
           }
           if (key === 'Tab' && !e.altKey && !accelerated(e)) {
@@ -1024,11 +1307,16 @@ window.__ModuleLoader__.load({
             e.preventDefault()
           }
         }
+        const onPointerDown = () => { exitPending = false }
         document.addEventListener('keydown', onKey, true)
         document.addEventListener('beforeinput', onBeforeInput, true)
+        document.addEventListener('pointerdown', onPointerDown, true)
         return () => {
+          disposed = true
+          if (descentRaf !== 0) cancelAnimationFrame(descentRaf)
           document.removeEventListener('keydown', onKey, true)
           document.removeEventListener('beforeinput', onBeforeInput, true)
+          document.removeEventListener('pointerdown', onPointerDown, true)
         }
       }, [applyPlan, selectionLines, liveText])
 
@@ -1347,7 +1635,7 @@ window.__ModuleLoader__.load({
         },
         role: 'dialog', 'aria-label': t('settings'),
       },
-      h('div', { class: 'clp-title' }, t('title')),
+      h('div', { class: 'clp-title' }, t('title'), h('span', { class: 'clp-title-ver' }, ` v${PLUGIN_VERSION}`)),
       h('div', { class: 'clp-tabs', role: 'tablist' },
         h('button', {
           type: 'button', role: 'tab',
@@ -1447,6 +1735,7 @@ window.__ModuleLoader__.load({
 .clp-group-title { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
 .clp-group-desc { color: var(--dsw-alias-label-secondary); font-size: 11px; }
 .clp-title { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); padding-bottom: 2px; }
+.clp-title-ver { font-size: 11px; font-weight: 400; color: var(--dsw-alias-label-tertiary); }
 .clp-tabs {
   display: flex; border: 1px solid var(--dsw-alias-border-l2); border-radius: 7px;
   overflow: hidden; margin-bottom: 2px; height: 32px; flex: none;
@@ -1600,7 +1889,7 @@ window.__ModuleLoader__.load({
       _pure: {
         parseItem, renderOrderedCore, renumberPlan, onlyMarkerEdit, togglePlan, indentPlan,
         continuationPlan, backspacePlan, promotePlan, arrowJump, lineBounds, lineRange,
-        lineIndexOf, meaninglessText,
+        lineIndexOf, meaninglessText, seDecision, exitTailFixPlan,
       },
     }
   },

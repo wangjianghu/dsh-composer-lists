@@ -117,14 +117,20 @@ eq(P.parseItem('plain'), null, 'parse non-item')
   eq(r.plan.text, '\n② ', 'continue circle next')
 }
 {
-  // Empty item joins the previous line: no blank line remains.
+  // Empty item exits by leaving an empty plain line: consecutive breaks can
+  // then blank a line after the list.
   const r = P.continuationPlan('1. a\n2. b\n3. ', 13, 13, SETTINGS)
-  eq(r.plan, { start: 9, end: 13, text: '' }, 'empty item exits into previous line')
+  eq(r.plan, { start: 9, end: 13, text: '\n\n' }, 'empty item exits into empty plain line')
 }
 {
-  // First-line empty item joins the following line up.
+  // First-line empty item also de-markers in place, keeping the line.
   const r = P.continuationPlan('1. \n2. x', 3, 3, SETTINGS)
-  eq(r.plan, { start: 0, end: 4, text: '' }, 'first empty item joins next line')
+  eq(r.plan, { start: 0, end: 3, text: '' }, 'first empty item leaves empty line')
+}
+{
+  // Indented empty item strips indent and marker together.
+  const r = P.continuationPlan('1. a\n  1. ', 9, 9, SETTINGS)
+  eq(r.plan, { start: 4, end: 10, text: '\n\n' }, 'indented empty item clears prefix')
 }
 eq(P.continuationPlan('plain', 1, 1, SETTINGS).consume, false, 'plain line not consumed')
 
@@ -382,7 +388,11 @@ eq(P.continuationPlan('z. x', 4, 4, SETTINGS).plan.text, '\naa. ', 'continue let
 eq(P.continuationPlan('1. abc', 2, 5, SETTINGS).plan, { start: 2, end: 5, text: '\n2. ' }, 'continue replaces selection')
 eq(P.continuationPlan('1. abc', 5, 5, SETTINGS).plan, { start: 5, end: 5, text: '\n2. ' }, 'continue splits at caret')
 eq(P.continuationPlan('1. ', 3, 3, SETTINGS).plan, { start: 0, end: 3, text: '' }, 'exit only item empties draft')
-eq(P.continuationPlan('1. a\n2. \n3. b', 8, 8, SETTINGS).plan, { start: 4, end: 8, text: '' }, 'exit middle empty item')
+eq(P.continuationPlan('1. a\n2. \n3. b', 8, 8, SETTINGS).plan, { start: 4, end: 8, text: '\n\n' }, 'exit middle empty item')
+// Exit collapses a following blank run so the visual matches a fresh exit.
+eq(P.continuationPlan('1. a\n2. \n\n', 8, 8, SETTINGS).plan, { start: 4, end: 10, text: '\n\n' }, 'exit collapses one trailing blank')
+eq(P.continuationPlan('1. a\n2. \n\n\n', 8, 8, SETTINGS).plan, { start: 4, end: 11, text: '\n\n' }, 'exit collapses a blank run')
+eq(apply('1. a\n2. \n\n\nX', P.continuationPlan('1. a\n2. \n\n\nX', 8, 8, SETTINGS).plan), '1. a\n\n\nX', 'exit before content keeps content, drops extra blanks')
 
 // --- backspacePlan: marker-only deletion shapes ---
 eq(P.backspacePlan('1.', 2, SETTINGS).plan, { start: 0, end: 2, text: '' }, 'bare marker deleted whole')
@@ -537,6 +547,146 @@ for (const text of ['1. a\n1. a\n1. a', '1. a\n  9. b\n    5. c\n2. d', 'a. x\nb
     ok(threw === null, `fuzz no throw #${n} (${JSON.stringify(text)})`)
   }
   console.log(`ok   fuzz ×${ROUNDS} rounds (planner bounds, idempotency, no-throw)`)
+}
+
+// --- seDecision: one Shift+Enter press (unit) ---
+{
+  const DOM = { anchorBlockEmpty: false, anchorTextAfterContent: false }
+  const d1 = P.seDecision('1. a', 4, 4, DOM, false, SETTINGS)
+  eq(d1, { kind: 'insert', renum: true, exited: false, plan: { start: 4, end: 4, text: '\n2. ' } }, 'SE: continue on item line')
+  const d2 = P.seDecision('1. a\n2. ', 8, 8, DOM, false, SETTINGS)
+  eq(d2, { kind: 'insert', renum: true, exited: true, plan: { start: 4, end: 8, text: '\n\n' } }, 'SE: empty item exits blank-with-caret-below')
+  const d3 = P.seDecision('1. a\n\n', 6, 6, DOM, true, SETTINGS)
+  eq(d3, { kind: 'insert', renum: false, exited: false, plan: { start: 6, end: 6, text: '\n' } }, 'SE: empty line grows by exactly one')
+  const d4 = P.seDecision('plain text', 5, 5, DOM, false, SETTINGS)
+  eq(d4.kind, 'native', 'SE: non-empty plain line stays native')
+  const d5 = P.seDecision('1. a\n', 5, 5, { anchorBlockEmpty: true, anchorTextAfterContent: false }, false, SETTINGS)
+  eq(d5, { kind: 'insert', renum: false, exited: false, plan: { start: 5, end: 5, text: '\n' } }, 'SE: caret in empty block grows blank')
+  // Gap reattribution: caret projected onto the empty line's start but
+  // anchored past the list line's content → continue the list.
+  const d6 = P.seDecision('1. a\n\n', 5, 5, { anchorBlockEmpty: false, anchorTextAfterContent: true }, false, SETTINGS)
+  eq(d6.plan.text, '\n2. ', 'SE: reattributed caret continues list under a blank')
+  // ...but not right after our own exit edit (exitPending).
+  const d7 = P.seDecision('1. a\n\n', 5, 5, { anchorBlockEmpty: false, anchorTextAfterContent: true }, true, SETTINGS)
+  eq(d7.kind === 'insert' && d7.renum, false, 'SE: exitPending suppresses reattribution')
+}
+// apply helper re-declared locally for the sequence harness below.
+const applySE = (text, plan) => text.slice(0, plan.start) + plan.text + text.slice(plan.end)
+
+// --- seDecision: full user-sequence regressions (one per reported bug) ---
+{
+  // Regression (reported flow): 1. a → SE (2.) → SE (exit: blank + caret
+  // BELOW the blank) → SE ×3 (one blank per press, caret strictly down).
+  const DOM = { anchorBlockEmpty: false, anchorTextAfterContent: false }
+  let st = { text: '1. a', caret: 4, exitPending: false }
+  const press = () => {
+    const d = P.seDecision(st.text, st.caret, st.caret, DOM, st.exitPending, SETTINGS)
+    if (d.kind !== 'insert') throw new Error('expected insert, got ' + d.kind)
+    st = {
+      text: applySE(st.text, d.plan),
+      caret: d.plan.start + d.plan.text.length, // insertion edits park the caret at the end
+      exitPending: d.exited === true ? true : st.exitPending,
+    }
+    return d
+  }
+  press()
+  eq(st, { text: '1. a\n2. ', caret: 8, exitPending: false }, 'seq: continue makes 2.')
+  press()
+  eq(st, { text: '1. a\n\n', caret: 6, exitPending: true }, 'seq: exit blanks one line, caret below it (never retreats)')
+  press()
+  eq(st, { text: '1. a\n\n\n', caret: 7, exitPending: true }, 'seq: second blank grows by exactly one (+1, not +2)')
+  press()
+  press()
+  eq(st.text, '1. a\n\n\n\n\n', 'seq: blanks accumulate one per press')
+  eq(st.caret, 9, 'seq: caret descends monotonically')
+  // Old bug guards: none of the intermediate states ever equal the
+  // retreat ("1. a" with caret 4 after the exit) or a +2 jump.
+  eq(P.lineBounds('1. a\n\n', 6).start, 6, 'seq: caret line is the trailing empty line')
+}
+{
+  // Regression: user CLICKS back to the list line's end under an existing
+  // blank (exitPending cleared by pointerdown) → the list continues.
+  const d = P.seDecision('1. a\n\n', 5, 5, { anchorBlockEmpty: false, anchorTextAfterContent: true }, false, SETTINGS)
+  eq(applySE('1. a\n\n', d.plan), '1. a\n2. \n', 'seq: clicked list-end continues numbering under blank')
+}
+{
+  // Regression: middle-of-list exit keeps the blank + caret line and the
+  // rest of the list intact.
+  const DOM = { anchorBlockEmpty: false, anchorTextAfterContent: false }
+  const d = P.seDecision('1. a\n2. \n3. b', 8, 8, DOM, false, SETTINGS)
+  eq(applySE('1. a\n2. \n3. b', d.plan), '1. a\n\n\n3. b', 'seq: middle exit leaves blank + caret line, list tail intact')
+}
+{
+  // Regression: caret genuinely ON the blank line (anchor in an empty
+  // block) never reatributes to the list line above.
+  const d = P.seDecision('1. a\n\n2. b', 5, 5, { anchorBlockEmpty: true, anchorTextAfterContent: false }, false, SETTINGS)
+  eq(d.plan.text, '\n', 'seq: blank-line caret grows the blank, does not renumber')
+}
+{
+  // Regression: bullet lists share the whole flow.
+  const DOM = { anchorBlockEmpty: false, anchorTextAfterContent: false }
+  let text = '- a'
+  let caret = 3
+  const press = () => {
+    const d = P.seDecision(text, caret, caret, DOM, false, SETTINGS)
+    text = applySE(text, d.plan)
+    caret = d.plan.start + d.plan.text.length
+  }
+  press()
+  eq(text, '- a\n- ', 'seq: bullet continues')
+  press()
+  eq(text, '- a\n\n', 'seq: bullet exit blanks + caret below')
+  press()
+  eq(text, '- a\n\n\n', 'seq: bullet blanks accumulate')
+}
+
+{
+  // Regression (reported round-2 flow): with OLD blanks still below, moving
+  // the caret back to the list line's end and repeating the sequence must
+  // land in the SAME state as a fresh round — the exit collapses the blank
+  // run instead of stacking onto it.
+  const DOM = { anchorBlockEmpty: false, anchorTextAfterContent: false }
+  let st = { text: '1. a\n\n\n', caret: 4, exitPending: false } // old blanks below
+  const press = () => {
+    const d = P.seDecision(st.text, st.caret, st.caret, DOM, st.exitPending, SETTINGS)
+    if (d.kind !== 'insert') throw new Error('expected insert, got ' + d.kind)
+    st = {
+      text: applySE(st.text, d.plan),
+      caret: d.plan.start + d.plan.text.length,
+      exitPending: d.exited === true ? true : st.exitPending,
+    }
+  }
+  press()
+  eq(st.text, '1. a\n2. \n\n\n', 'seq2: list continues above old blanks')
+  press()
+  eq(st, { text: '1. a\n\n', caret: 6, exitPending: true }, 'seq2: exit collapses old blanks to the fresh-round state')
+}
+
+// --- adversarial-review fixes: first-line collapse, lone-tail renumber, clamps ---
+eq(apply('1. \n\n\nfoo', P.continuationPlan('1. \n\n\nfoo', 3, 3, SETTINGS).plan), '\nfoo', 'first-line exit collapses its blank run too')
+eq(apply('1. \n\n\n', P.continuationPlan('1. \n\n\n', 3, 3, SETTINGS).plan), '', 'first-line exit on all-blank draft clears it')
+{
+  const r = P.continuationPlan('1. a\n2. \n3. b', 5, 10, SETTINGS)
+  eq(r.plan.end >= 10, true, 'exit replaces a selection extending past the blank run')
+}
+eq(apply('1. a\n2. \n3. b', P.exitTailFixPlan('1. a\n2. \n3. b', 8, SETTINGS)), '1. a\n2. \n1. b', 'lone ordered tail renumbers to 1.')
+eq(P.exitTailFixPlan('1. a\n2. \n3. b\n4. c', 8, SETTINGS), null, 'multi-item tail left to renumberPlan')
+eq(P.exitTailFixPlan('1. a\n2. \n\n9. x', 8, SETTINGS), null, 'blank-separated standalone number untouched')
+eq(P.exitTailFixPlan('1. a\n- \n- x', 8, SETTINGS), null, 'bullet tail needs no renumber')
+eq(P.exitTailFixPlan('1. a\n2. \n1. b', 8, SETTINGS), null, 'already-correct lone tail is a no-op')
+{
+  // End-to-end: exit + tail fix compose into the final draft.
+  const exitPlan = P.continuationPlan('1. a\n2. \n3. b', 8, 8, SETTINGS).plan
+  const tail = P.exitTailFixPlan('1. a\n2. \n3. b', 8, SETTINGS)
+  const afterExit = apply('1. a\n2. \n3. b', exitPlan)
+  const delta = exitPlan.text.length - (exitPlan.end - exitPlan.start)
+  eq(apply(afterExit, { ...tail, start: tail.start + delta, end: tail.end + delta }),
+    '1. a\n\n\n1. b', 'exit + tail fix yields blank + caret line + renumbered tail')
+}
+{
+  // Out-of-range spans are clamped, never produce out-of-bounds plans.
+  const r = P.seDecision('1. a', 999, 999, { anchorBlockEmpty: false, anchorTextAfterContent: false }, false, SETTINGS)
+  eq(r.plan.start <= 4 && r.plan.end <= 4 + r.plan.text.length, true, 'clamped span stays in bounds')
 }
 
 if (failures > 0) {

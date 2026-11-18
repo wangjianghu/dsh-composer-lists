@@ -1,70 +1,56 @@
 # dsh-composer-lists
 
-[![CI](https://github.com/wangjianghu/dsh-composer-lists/actions/workflows/ci.yml/badge.svg)](https://github.com/wangjianghu/dsh-composer-lists/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/dsh-composer-lists)](https://www.npmjs.com/package/dsh-composer-lists)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+**English** · Ordered/unordered list editing for the DeepSeek Harness (DSH) message composer: automatic numbering and renumbering across six marker styles, marker-aware caret moves, level promotion/demotion, a natural blank-line flow (exit a list, then keep pressing Shift+Enter to add blank lines one by one), and a one-click AI prompt-polish button that rewrites your draft into structured lists via the host's model — fully undoable.
 
-**一键把粗糙的想法改写成结构化的 Agent 提示词**，再把输入框变成顺手的多级列表编辑器。Turn a rough idea into a structured agent prompt in one click — plus ordered/unordered list editing in the DSH composer.
+**中文** · DSH 聊天输入框的列表编排插件。输入框工具行保留 ✨（AI 优化提示词，可在设置中隐藏）和 ⚙（设置）两个小图标，其余全部走快捷键。
 
-## ✨ AI 提示词结构化改写（核心功能）
-
-写 Agent 提示词最耗时的不是措辞，是结构：目标、步骤、约束混成一团，模型只能猜。点一下输入框旁的 ✨，当前草稿会被改写为「**一句话任务目标 + 有序步骤列表（含子层级）+ 无序约束与验收标准**」的结构化提示词——正是 Agent 最容易准确执行的形态。
-
-改写效果示例 / What the rewrite looks like:
-
-```text
-✨ 改写前                                          改写后 ↩
-帮我做个周报，要包含这周做了什么，              1. 生成本周工作周报，按项目分组。
-下周的计划，还有些数据要整理一下，                 1. 汇总本周各项目进展与关键结果；
-老板喜欢看图表，别太长                            2. 整理下周计划，标注优先级。
-                                              - 输出包含进度图表，正文控制在 500 字内；
-                                              - 只使用草稿中提到的事实，不补充假设。
-```
-
-工程上为「点一下就完事」做了完整闭环：
-
-- **一键撤销**：改写完成后 ✨ 变 ↩，一键恢复原文；手动编辑过结果后撤销自动退场，绝不吞你的修改
-- **跨模型自适应**：自动选用当前默认模型自己声明的**最轻思考档**（改写不需要推理，速度从十几秒降到 2–5 秒；模型未声明档位则自动跳过）
-- **自愈与防护**：思考耗尽生成预算时自动加倍重试；请求 90 秒硬超时，优化中按 Esc 立即中止；草稿含引用/命令 chip 时自动禁用；无意义输入（过短、纯符号、复读）直接拦截
-- **透明失败**：出错时明确提示原因（超时/模型拒绝/无可用模型），输入框永不锁死
-
-## 列表编排（第二能力）
-
-结构化提示词里全是列表——所以输入框本身也需要顺手的列表编辑。遵循 DSH 原生按键（Enter 发送、⌘Enter 加速发送不改动）：
+## 行为（遵循 DSH 原生按键）
 
 | 手势 | 行为 |
 |---|---|
-| **Shift+Enter** | 列表行内换行并自动续号（沿用当前行样式）；空项上按 = 退出列表 |
-| **Backspace** | 光标紧跟标记后：二级及更深 → 升一级（`b. `→`2. `，光标停在当前行）；一级 → 整个标记一步删掉；空项 → 退出 |
-| **← / →** | 标记前缀作为一步跨过（标记右侧 ← 一次到行首，行首 → 一次到标记右侧） |
-| **⌘← / Home** | 跳到行首；列表行落在标记右侧，再按到最左 |
-| **Tab / Shift+Tab** | 降 / 升一级，所在块按新层级重排样式与编号；层级改变时光标保持原字符位置 |
-| **⌘⇧8 / ⌘⇧7** | 当前行或选中行：加无序 / 有序标记；再按取消 |
-| **⌘⇧B** | 选中文本加 `**粗体**`（⌘B 被 DSH 菜单占用） |
-| 输入/删除/粘贴 | 有序编号自动重排；手改编号不会被覆盖 |
+| Enter | 发送（原生，不改动） |
+| ⌘/Ctrl+Enter | 加速发送（原生，不改动） |
+| **Shift+Enter** | 列表行内换行并自动续号（沿用当前行样式：`1.`→`2.`、`a.`→`b.`、`①`→`②`）；空列表项上按 = 退出列表并空出 1 行，光标落在空行的下一行；之后继续按每按多空一行（光标逐行下移）；仅当全稿只有这一个空列表项时清空整稿。光标被用户主动移回列表行行尾（点击/方向键）再按则恢复续号 |
+| **Backspace** | 光标紧跟标记后：**二级及更深 → 升一级**（当前行去掉一级缩进、标记换上级样式并接续编号，光标定位到新标记右侧，如 `b. `→`2. `）；一级 → 整个标记一步删掉；空列表项 → 删整行并入上一行行尾 |
+| **Tab / Shift+Tab** | 仅列表行：降 / 升一级层级，所在块自动按新层级重排样式与编号（`1.`→Tab→`a.`→Tab→`①`；无序符号同样随层级切换）；多行选中批量 |
+| **⌘⇧8 / ⌘⇧7** | 当前行或选中行：加无序 / 有序标记；再按取消；可反复循环；折叠光标保持在原字符位置（有序编号延续上下文并连后续行一起重排，并入同一次编辑，不触发二次重排挪动光标） |
+| **← / →** | 标记前缀（缩进+编号/符号+空格）作为一步跨过：标记右侧按 ← 一次到行首，行首按 → 一次到标记右侧 |
 
-默认六级样式：有序 `1.` → `a.` → `①` → `(1)` → `α.` → `1.`，无序 `- * + • ○ ▪`；每层可在 ⚙ 设置中自定义，缩进宽度 2/4/8 可选。手写 `a.` `α.` `(3)` `①` 同样被识别并参与重排。
+## AI 优化提示词（✨ 按钮，可隐藏）
 
-## 安装 / Install
+一个按钮三种状态：**✨ 闪烁星图标**（点击优化，当前草稿发送给 Host 侧的 `POST /composer-lists/optimize`，由当前默认模型改写为「任务目标 + 有序步骤 + 无序约束」的结构化列表并替换输入框内容）→ **优化中**（图标脉动、按钮禁用）→ **↩ 撤销图标**（点击一键恢复优化前原文；手动编辑过优化结果后撤销自动退场，不会吞掉你的修改）。草稿为空、发送锁定或含引用 chip 时按钮禁用/跳过。⚙ 设置里可关闭「显示提示词优化按钮」。
 
-```sh
-dsh plugin add dsh-composer-lists
+稳定性保障：优化请求 **90 秒硬超时**，超时自动取消并解锁输入框；优化进行中按 **Esc 可立即中止**；飞行途中切换会话导致草稿变化时，改写结果会被丢弃而不是写入新会话。Host 侧检测客户端断连即停止模型流，provider 卡流 120 秒强制超时，不会悬挂 handler。
+
+## 层级样式（默认，⚙ 中可自定义）
+
+| 层级 | 有序 | 无序 |
+|---|---|---|
+| 一级 | `1. 2. 3.` | `-` |
+| 二级 | `a. b. c.` | `*` |
+| 三级 | `① ② ③` | `+` |
+| 四级 | `(1) (2) (3)` | `•` |
+| 五级 | `α. β. γ.` | `○` |
+| 六级 | `1. 2. 3.` | `▪` |
+
+每层有序样式可选：阿拉伯 `1.`、字母 `a.`、希腊 `α.`、括号 `(1)`、圆圈 `①`；无序符号可选 `- * + • ○ ▪ –`；缩进宽度 2/4/8 空格；另有「有序编号自动重排」和「显示提示词优化按钮」开关。设置存浏览器 localStorage（键 `dsh.composerLists`），即时生效。
+
+手写 `a.` `α.` `(3)` `①` 同样被识别为有序列表并参与自动重排（重排归一为层级样式；续号沿用当前行样式）。
+
+## 实现说明
+
+- 客户端所有编辑经会话槽位 props 的 `inputActions.insertText / setDraft`（一次手势 = 一步撤销）。
+- 编辑前从编辑器 DOM 重建 detect 投影（文本 span 递归取文本、`contenteditable="false"` 的原子 chip 计 1 个 U+FFFC、空段落的占位 `<br>` 计空串）并与 `InputState.draft` 比对；含引用 chip / 命令 chip / 引用块时键盘编排自动停用。
+- Host 半（index.js）：`inject: ['llm']`，软注入 `webServer` 注册优化路由，模型取 `agentDefaultModel.currentSelection()`（缺省回退第一个 provider），`ctx.llm.stream` 流式拼接文本；输入限 64KB，请求体限 256KB，跨域 Origin 按完整 host 精确比对拒绝。
+- 触发菜单（`/`、`@` 补全）打开时不拦截任何键；IME 组词期间不处理按键。
+- 测试：`node test-pure.cjs`（纯函数回归 + 400 轮确定性混沌：计划边界、重排幂等、不抛异常）；`node bench-pure.cjs`（纯层性能基准，实测每按键路径 ≤0.03ms@50 行 / 0.73ms@2000 行压力档）。
+
+## 安装
+
+```bash
+# npm 安装（推荐）
+npm install -g dsh-composer-lists
+# 或在 DSH 工作区内经 plugin_manager install_bundle 安装本仓库目录
 ```
 
-Requires dsh 0.2.1+. 已收录于 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 市场目录 / listed in the plugin catalog. 刷新页面生效。
-
-AI 改写使用你当前配置的默认模型，经 Host 本地路由（`POST /composer-lists/optimize`）完成，不引入额外密钥或第三方服务。
-
-## 开发 / Development
-
-```sh
-node test-pure.cjs   # 8000+ 断言：纯函数回归 + 确定性混沌测试
-node test-host.cjs   # Host 路由集成测试（假 req/res 驱动）
-node bench-pure.cjs  # 性能基准（每按键路径 <1ms）
-```
-
-改 `client.js` 后停用→启用插件即同步页面；改 `index.js`（Host 半）需重启 dsh。
-
-## License
-
-[MIT](./LICENSE)
+本地开发：克隆后改代码，用 `set_plugin` 停用→启用一次即可同步到页面（或刷新页面）；`node test-pure.cjs && node test-host.cjs` 全绿再提交。
