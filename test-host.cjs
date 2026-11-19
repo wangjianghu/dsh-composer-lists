@@ -38,6 +38,8 @@ function fakeRes () {
   return {
     state,
     get writableEnded () { return state.ended },
+    get statusCode () { return state.status },
+    set statusCode (v) { state.status = v },
     on (event, cb) { if (event === 'close') state.closeListeners.push(cb) },
     writeHead (status, headers) { state.status = status; state.headers = headers; return this },
     end (body) { state.ended = true; state.body = body; return this },
@@ -59,11 +61,20 @@ async function main () {
   const mod = await import(pathToFileURL(path.join(__dirname, 'index.js')).href)
 
   let route = null
+  // The connection trust fence, stubbed: `nextRejection` forces a rejection
+  // status for the next request(s); undefined means trusted.
+  let nextRejection
   const fakeCtx = {
     llm: null,
     get: () => undefined,
     inject: (names, cb) => {
-      cb({ webServer: { register (r) { route = r } } })
+      if (!names.includes('webServer') || !names.includes('connection')) {
+        throw new Error('route wiring must inject webServer and connection')
+      }
+      cb({
+        webServer: { register (r) { route = r } },
+        connection: { requestRejection: () => nextRejection },
+      })
       return () => {}
     },
     effect: (fn) => fn(),
@@ -115,6 +126,19 @@ async function main () {
 
   const TEXT = '帮我写一份周报，包含本周进展和下周计划'
   const bodyOf = (text) => JSON.stringify({ text })
+
+  // 0. Trust fence: a connection rejection short-circuits with its status,
+  //    empty body, and no model call.
+  useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '不该出现' }, { type: 'finish', reason: 'stop' }] })
+  {
+    nextRejection = 401
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    nextRejection = undefined
+    eq(res.status, 401, 'rejected request answers the fence status')
+    eq(res.body ?? '', '', 'rejected request sends no body')
+    eq(parsed, null, 'rejected request sends no JSON')
+    eq(calls.length, 0, 'rejected request never reaches the model')
+  }
 
   // 1. Happy path: lightest effort applied, 4096 ceiling, JSON reply.
   useLlm({

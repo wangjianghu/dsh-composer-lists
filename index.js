@@ -3,8 +3,11 @@
  *
  * Serves POST /composer-lists/optimize for the browser half's prompt-polish
  * button: body { text } → { ok, text } with the draft rewritten by the
- * current default model as a structured list. The route is loopback-only by
- * deployment and rejects cross-origin callers by Origin header.
+ * current default model as a structured list. Every request passes the
+ * composition's `connection` trust fence first (`requestRejection`: the
+ * Host/Origin fence defeats DNS rebinding and cross-site calls, and the
+ * browser authentication cookie gates every caller) before any body is
+ * read; a same-origin check backs it up as defense in depth.
  */
 export const inject = ['llm']
 
@@ -95,8 +98,8 @@ async function lightestEffort (ctx, provider, model) {
 
 export function apply (ctx) {
   // Optional wiring: headless compositions have no web server to serve. The
-  // inject callback receives a child scope Context; the service rides it.
-  ctx.effect(() => ctx.inject(['webServer'], (scope) =>
+  // inject callback receives a child scope Context; the services ride it.
+  ctx.effect(() => ctx.inject(['webServer', 'connection'], (scope) =>
     scope.webServer.register({
       kind: 'exact',
       path: '/composer-lists/optimize',
@@ -107,6 +110,14 @@ export function apply (ctx) {
           res.end(JSON.stringify(payload))
         }
         try {
+          // Trust fence first (the DSH-recommended pattern): Host/Origin
+          // fence plus browser authentication, before anything is read.
+          const rejection = scope.connection.requestRejection(req)
+          if (rejection !== undefined) {
+            res.statusCode = rejection
+            res.end()
+            return
+          }
           if (req.method !== 'POST') return reply(405, { ok: false, error: 'POST only' })
           const origin = req.headers.origin
           const host = String(req.headers.host ?? '')
