@@ -1,5 +1,5 @@
 /**
- * @local/composer-lists — browser half.
+ * dsh-composer-lists — browser half.
  *
  * Automatic ordered/unordered list editing inside the DSH message composer,
  * following the composer's native keymap decisions:
@@ -31,7 +31,7 @@
  * hands-off (insertText would simply fail, but we prefer not to guess).
  */
 window.__ModuleLoader__.load({
-  id: '@local/composer-lists',
+  id: 'dsh-composer-lists',
   factory (require) {
     const React = require('react')
     const { createElement: h, useState, useEffect, useRef, useCallback } = React

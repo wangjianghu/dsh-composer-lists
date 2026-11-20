@@ -1,5 +1,5 @@
 /**
- * Host half of @local/composer-lists.
+ * Host half of dsh-composer-lists.
  *
  * Serves POST /composer-lists/optimize for the browser half's prompt-polish
  * button: body { text } → { ok, text } with the draft rewritten by the
