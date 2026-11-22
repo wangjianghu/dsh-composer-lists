@@ -218,12 +218,53 @@ async function main () {
     eq(calls.length, 2, 'no third call')
   }
 
-  // 7. Zero output for a non-max-tokens reason → no retry.
+  // 7. Zero output for a non-max-tokens, non-tool-calls reason → no retry.
   useLlm({ chunksByCall: () => [{ type: 'finish', reason: 'content-filter' }] })
   {
     const { res } = await run({ body: bodyOf(TEXT) })
     eq(res.status, 502, 'content-filter 502')
     eq(calls.length, 1, 'no retry for non-max-tokens')
+  }
+
+  // 7a. Every stream call asks for protocol-level tool suppression.
+  useLlm({ chunksByCall: () => [{ type: 'text-delta', text: 'ok 内容' }, { type: 'finish', reason: 'stop' }] })
+  {
+    await run({ body: bodyOf(TEXT) })
+    eq(lastOptions().toolChoice, 'none', 'first call passes toolChoice none')
+  }
+
+  // 7b. tool-calls ending → one nudge retry (same ceiling, appended system), succeeds.
+  useLlm({
+    chunksByCall: (n) => n === 1
+      ? [{ type: 'finish', reason: 'tool-calls' }]
+      : [{ type: 'text-delta', text: '禁工具 重试成功' }, { type: 'finish', reason: 'stop' }],
+  })
+  {
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq(res.status, 200, 'tool-calls nudge retry succeeds')
+    eq(parsed?.text, '禁工具 重试成功', 'nudge retry text returned')
+    eq(calls.length, 2, 'exactly two stream calls')
+    eq(calls[1].maxTokens, 4096, 'nudge retry keeps the ceiling')
+    ok(calls[1].system.length > calls[0].system.length, 'nudge retry appends to the system prompt')
+    ok(calls[1].system.includes('不能调用任何工具'), 'nudge retry carries the no-tools instruction')
+    eq(calls[1].toolChoice, 'none', 'nudge retry still passes toolChoice none')
+  }
+
+  // 7c. tool-calls twice → 502 with the descriptive message, no third call.
+  useLlm({ chunksByCall: () => [{ type: 'finish', reason: 'tool-calls' }] })
+  {
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq(res.status, 502, 'tool-calls twice 502')
+    ok((parsed?.error ?? '').includes('已重试一次仍失败'), 'descriptive tool-calls failure')
+    eq(calls.length, 2, 'no third call after the nudge retry')
+  }
+
+  // 7d. Object finish reason carries kind and message.
+  useLlm({ chunksByCall: () => [{ type: 'finish', reason: { kind: 'error', message: 'boom' } }] })
+  {
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq(res.status, 502, 'object reason 502')
+    eq(parsed?.error, 'generation stopped: error: boom', 'object reason renders kind + message')
   }
 
   // 8. Method guard.

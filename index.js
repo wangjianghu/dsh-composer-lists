@@ -3,15 +3,27 @@
  *
  * Serves POST /composer-lists/optimize for the browser half's prompt-polish
  * button: body { text } → { ok, text } with the draft rewritten by the
- * current default model as a structured list. Every request passes the
- * composition's `connection` trust fence first (`requestRejection`: the
- * Host/Origin fence defeats DNS rebinding and cross-site calls, and the
- * browser authentication cookie gates every caller) before any body is
- * read; a same-origin check backs it up as defense in depth.
+ * current default model as a structured list. Tool use is suppressed in two
+ * layers: every stream call passes `toolChoice: 'none'` (protocol level,
+ * translated per provider by the DSH adapters), and a model that still ends
+ * with tool calls gets one retry with an explicit no-tools system nudge.
+ * Every request passes the composition's `connection` trust fence first
+ * (`requestRejection`: the Host/Origin fence defeats DNS rebinding and
+ * cross-site calls, and the browser authentication cookie gates every
+ * caller) before any body is read; a same-origin check backs it up as
+ * defense in depth.
  */
 export const inject = ['llm']
 
 const SYSTEM_PROMPT = '把指令草稿改写为结构清晰的提示词：一句话任务目标；有序列表分步骤（缩进子列表表层级）；无序列表列约束与验收标准。保留原意与语言，不臆造，无解释无代码围栏，直接输出 Markdown 列表。'
+
+/**
+ * Appended to the system prompt ONLY on the no-tools retry: some models
+ * ignore `toolChoice: 'none'` (or sit behind server-forced tools) and end
+ * their turn with tool calls instead of text; the nudge makes the retry's
+ * instruction explicit.
+ */
+const NO_TOOL_NUDGE = ' 本次调用不需要也不能调用任何工具（无工具可用）；必须直接输出 Markdown 文本。'
 
 const MAX_INPUT_CHARS = 65536
 const MAX_BODY_BYTES = 262144
@@ -161,14 +173,17 @@ export function apply (ctx) {
           // The rewrite needs no thinking: use the route's lightest declared
           // effort instead of the user's global (possibly heavy) selection.
           const lightEffort = await lightestEffort(ctx, selection.provider, selection.model)
-          const runStream = async (maxTokens) => {
+          const runStream = async (maxTokens, system = SYSTEM_PROMPT) => {
             let out = ''
             let failure = ''
             const iterator = ctx.llm.stream({
               provider: selection.provider,
               model: selection.model,
               ...(lightEffort === undefined ? {} : { reasoningEffort: lightEffort }),
-              system: SYSTEM_PROMPT,
+              // Layer 1 — protocol-level tool suppression, translated by the
+              // DSH adapters per provider. The rewrite never needs tools.
+              toolChoice: 'none',
+              system,
               messages: [{ role: 'user', content: [{ type: 'text', text }] }],
               maxTokens,
             })[Symbol.asyncIterator]()
@@ -184,7 +199,9 @@ export function apply (ctx) {
                   const reason = chunk.reason
                   failure = typeof reason === 'string' ? reason
                     : reason !== null && typeof reason === 'object'
-                      ? String(reason.message ?? reason.kind ?? reason.type ?? JSON.stringify(reason))
+                      ? String(reason.message !== undefined && reason.message !== ''
+                          ? `${reason.kind ?? 'error'}: ${reason.message}`
+                          : (reason.kind ?? reason.type ?? JSON.stringify(reason)))
                       : 'unknown'
                 }
               }
@@ -196,11 +213,21 @@ export function apply (ctx) {
           let result = await runStream(4096)
           // Never retry after the browser side is gone (its own timeout or
           // Escape abort already freed the client).
-          if (!result.aborted && !clientGone && result.out.trim() === '' && result.failure.includes('max-tokens')) {
-            // A force-thinking model burned the whole budget on reasoning
-            // before any text: retry once with a doubled ceiling instead of
-            // failing the rewrite (self-healing in place of a config knob).
-            result = await runStream(8192)
+          if (!result.aborted && !clientGone && result.out.trim() === '') {
+            // Layer 2 — branch the single retry by finish reason:
+            //  - max-tokens: a force-thinking model burned the whole budget
+            //    on reasoning; retry with a doubled ceiling.
+            //  - tool-calls: the model ignored toolChoice:'none' (or sits
+            //    behind server-forced tools); retry once with an explicit
+            //    no-tools nudge in the system prompt.
+            if (result.failure.includes('max-tokens')) {
+              result = await runStream(8192)
+            } else if (result.failure.includes('tool-calls')) {
+              result = await runStream(4096, SYSTEM_PROMPT + NO_TOOL_NUDGE)
+              if (!result.aborted && !clientGone && result.out.trim() === '' && result.failure.includes('tool-calls')) {
+                result = { aborted: false, out: '', failure: 'tool-calls（模型选择调用工具而非输出文本，已重试一次仍失败）' }
+              }
+            }
           }
           if (result.aborted) return
           const trimmed = result.out.trim()
