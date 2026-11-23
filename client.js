@@ -29,6 +29,23 @@
  * the published `InputState.draft`; when the draft carries reference chips,
  * command chips or quotes the two projections diverge and the plugin stays
  * hands-off (insertText would simply fail, but we prefer not to guess).
+ *
+ * Three invariants the key handler and the auto-renumber reaction keep:
+ *
+ *   caret   insertText always parks the caret at the END of the inserted
+ *           text. So every gesture is applied as an edit SET whose caret
+ *           edit goes LAST and ends at the caret (lines after it renumber
+ *           first); the reaction is folded into the same set. A reaction
+ *           that has nothing ending at the caret (a line was just deleted)
+ *           re-parks it with a content-neutral edit after the first changed
+ *           marker instead of leaving it on the block's tail.
+ *   undo    each insertText is its own undo entry, so the reaction must
+ *           never answer Cmd+Z: the restored draft is exactly the state the
+ *           user went back to, and re-fixing it made undo a no-op forever.
+ *   scope   the key handler is a document-level capture listener: it only
+ *           claims the composer its own button lives in (the host InputBar
+ *           card), never another editor on the page, and one driver per
+ *           composer even when the slot is registered twice.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-composer-lists',
@@ -42,7 +59,7 @@ window.__ModuleLoader__.load({
     // ------------------------------------------------------------------
 
     /** Plugin version, mirrored into package.json — shown in the settings popover title. */
-    const PLUGIN_VERSION = '1.3.4'
+    const PLUGIN_VERSION = '1.4.0'
 
     /** Ordered marker styles: arabic `1.`, letter `a.`, greek `α.`, paren `(1)`, circle `①`. */
     const ORDERED_STYLES = ['arabic', 'letter', 'greek', 'paren', 'circle']
@@ -181,25 +198,48 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** Char offset where each line of `lines` starts inside its joined text. */
+    function lineStarts (lines) {
+      const starts = new Array(lines.length)
+      let at = 0
+      for (let k = 0; k < lines.length; k += 1) {
+        starts[k] = at
+        at += lines[k].length + 1
+      }
+      return starts
+    }
+
     /**
      * Rewrite the markers of every list block in `lines[i..j]`: ordered
      * numbers sequential per indent level in that level's configured style,
-     * resetting when the list returns to a shallower level; with `force`
-     * (an explicit level change) single-item blocks normalize too and bullet
-     * chars follow each level's configured symbol.
+     * resetting when the list returns to a shallower level; where `force`
+     * applies (an explicit level change) single-item blocks normalize too
+     * and bullet chars follow each level's configured symbol. `force` is
+     * `true` (every line), `false` (none) or the LAST line index up to which
+     * it applies — so one pass can restyle the shifted lines and still
+     * produce what the auto-renumber reaction would settle on for the rest
+     * of the block. `lone` names ONE single-item block line (by index) whose
+     * ordered marker also normalizes to the level's first marker — the line
+     * an exit left behind.
+     * Only `lines[i..j]` is parsed: callers pass sub-ranges of big drafts.
      * @returns {{out:string[], changed:number[]}}
      */
-    function renumberLines (lines, i, j, settings, force) {
+    function renumberLines (lines, i, j, settings, force, lone) {
       const unit = settings.indentUnit
-      const items = lines.map(parseItem)
+      const forced = force === true
+        ? () => true
+        : typeof force === 'number' ? index => index <= force : () => false
+      const items = new Array(lines.length)
+      for (let k = Math.max(0, i); k <= Math.min(j, lines.length - 1); k += 1) items[k] = parseItem(lines[k])
       const out = lines.slice()
       const changed = []
       let k = i
       while (k <= j) {
-        if (items[k] === null) { k += 1; continue }
+        if (items[k] == null) { k += 1; continue }
         let e = k
-        while (e + 1 <= j && items[e + 1] !== null) e += 1
-        if (e > k || force) {
+        while (e + 1 <= j && items[e + 1] != null) e += 1
+        const it0 = items[k]
+        if (e > k || forced(k) || (lone !== undefined && e === k && it0.ordered)) {
           const counters = new Map()
           const stack = []
           for (let m = k; m <= e; m++) {
@@ -217,7 +257,7 @@ window.__ModuleLoader__.load({
                 out[m] = it.indent + core + ' ' + it.rest.replace(/^[ \t]/, '')
                 changed.push(m)
               }
-            } else if (force && settings.bulletStyles[level] !== it.bullet) {
+            } else if (forced(m) && settings.bulletStyles[level] !== it.bullet) {
               out[m] = it.indent + settings.bulletStyles[level] + ' ' + it.rest.replace(/^[ \t]/, '')
               changed.push(m)
             }
@@ -231,16 +271,15 @@ window.__ModuleLoader__.load({
     /**
      * Content-driven renumbering (typing, deleting, pasting): blocks with at
      * least two items, ordered markers only. Marker-scope replacement keeps
-     * the caret near the edit instead of the block end.
+     * the caret near the edit instead of the block end. `lone` optionally
+     * names one leftover single-item line whose marker restarts at 1.
      * @returns {null|{start:number,end:number,text:string}}
      */
-    function renumberPlan (text, settings) {
+    function renumberPlan (text, settings, lone) {
       const lines = text.split('\n')
-      const { out, changed } = renumberLines(lines, 0, lines.length - 1, settings, false)
+      const { out, changed } = renumberLines(lines, 0, lines.length - 1, settings, false, lone)
       if (changed.length === 0) return null
-      const a = changed[0]
-      const b = changed[changed.length - 1]
-      return markerScopePlan(text, a, b, out)
+      return scopePlan(lines, changed[0], changed[changed.length - 1], out)
     }
 
     /**
@@ -256,7 +295,10 @@ window.__ModuleLoader__.load({
       let s = 0
       while (s < n - p && prev.charAt(prev.length - 1 - s) === next.charAt(next.length - 1 - s)) s += 1
       const mid = prev.slice(p, prev.length - s)
-      if (mid.includes('\n')) return false
+      // Whatever was inserted must stay inside the same marker too: a whole
+      // line pasted at a line start diffs as "nothing removed, an item
+      // added" and is NOT a hand edit of the neighbour's marker.
+      if (mid.includes('\n') || next.slice(p, next.length - s).includes('\n')) return false
       const lineStart = prev.lastIndexOf('\n', p - 1) + 1
       const lineEndPrev = prev.indexOf('\n', p)
       const it = parseItem(prev.slice(lineStart, lineEndPrev < 0 ? prev.length : lineEndPrev))
@@ -308,15 +350,20 @@ window.__ModuleLoader__.load({
      * end: rewriting only marker prefixes keeps the caret at the marker's
      * right side instead of jumping to the block end. Line b's content after
      * its marker stays in the document untouched.
+     * @param {string[]} lines - the text, already split
+     * @param {{oldEnd:number,newEnd:number}} [last] - line b's prefix lengths
+     *   (old line / new line) when they differ from the plain marker ends
      */
-    function markerScopePlan (text, a, b, out) {
-      const lines = text.split('\n')
-      const start = lineRange(text, a, a).start
-      const end = lineRange(text, b, b).start + markerEndOf(lines[b])
+    function scopePlan (lines, a, b, out, last) {
+      const starts = lineStarts(lines)
       const pieces = []
       for (let k = a; k < b; k++) pieces.push(out[k])
-      pieces.push(out[b].slice(0, markerEndOf(out[b])))
-      return { start, end, text: pieces.join('\n') }
+      pieces.push(out[b].slice(0, last === undefined ? markerEndOf(out[b]) : last.newEnd))
+      return { start: starts[a], end: starts[b] + (last === undefined ? markerEndOf(lines[b]) : last.oldEnd), text: pieces.join('\n') }
+    }
+
+    function markerScopePlan (text, a, b, out, last) {
+      return scopePlan(text.split('\n'), a, b, out, last)
     }
 
     /**
@@ -388,11 +435,26 @@ window.__ModuleLoader__.load({
           lastTrail = k
         }
       }
+      // A line stripped of its marker may still READ as an item ("1. 2. x" →
+      // "2. x"): its new prefix is then the indent alone, and an inner marker
+      // that needs renumbering converges inside the same edit. Re-reading
+      // that prefix as a marker duplicated content ("- - x" toggle-off gave
+      // "- xx") or made the key a no-op. The inner marker is measured
+      // WITHOUT its indent (the indent is not part of what the old line's
+      // outer marker replaced), or the plan would swallow the content after
+      // the caret ("- - * b", caret after the outer marker, lost "b").
+      const stripPrefix = (k) => {
+        const outer = markerEndOf(lines[k])
+        const indentLen = items[k - a].indentLen
+        if (parseItem(out[k]) === null) return { oldEnd: outer, newEnd: indentLen }
+        return { oldEnd: outer + markerEndOf(out[k]) - indentLen, newEnd: markerEndOf(norm[k]) }
+      }
       if (caret === undefined) {
         // Selection: one marker-scope replacement reaching back/forward to
         // every line the convergence touched; the caret parks after the
         // final marker as before.
-        return { pre: null, plan: markerScopePlan(text, from, Math.max(last, lastTrail), norm) }
+        const b = Math.max(last, lastTrail)
+        return { pre: null, plan: markerScopePlan(text, from, b, norm, remove && b === last ? stripPrefix(last) : undefined) }
       }
       const lastStart = lineRange(text, last, last).start
       const lastEnd = lineRange(text, last, last).end
@@ -400,12 +462,12 @@ window.__ModuleLoader__.load({
       // an off-line caret can never pull the '\n' past the line end into
       // the replacement (which would overlap `pre`).
       const caretOnLine = Math.min(Math.max(caret, lastStart), lastEnd)
-      const oldEnd = lastStart + markerEndOf(lines[last])
+      const prefix = remove ? stripPrefix(last) : { oldEnd: markerEndOf(lines[last]), newEnd: markerEndOf(norm[last]) }
+      const oldEnd = lastStart + prefix.oldEnd
       const contentOffset = Math.max(0, caretOnLine - oldEnd)
-      const newEnd = markerEndOf(norm[last])
       const pieces = []
       for (let k = from; k < last; k++) pieces.push(norm[k])
-      pieces.push(norm[last].slice(0, Math.min(norm[last].length, newEnd + contentOffset)))
+      pieces.push(norm[last].slice(0, Math.min(norm[last].length, prefix.newEnd + contentOffset)))
       return {
         pre: firstTrail >= 0 ? markerScopePlan(text, firstTrail, lastTrail, norm) : null,
         plan: { start: lineRange(text, from, from).start, end: Math.max(caretOnLine, oldEnd), text: pieces.join('\n') },
@@ -418,7 +480,14 @@ window.__ModuleLoader__.load({
      * each level's configured style (a demoted `2.` becomes `a.`, a promoted
      * `a.` becomes `1.`, bullets follow the level symbol). Non-item lines are
      * left untouched; when no line is an item the caller keeps native Tab.
-     * @returns {null|{start:number,end:number,text:string}}
+     *
+     * With a collapsed `caret` the plan ends at the caret (insertText then
+     * parks it on the same content character) and covers the block only up
+     * to the caret line; later siblings converge the way the auto-renumber
+     * reaction would through `plan.pre` — applied FIRST by the caller, so
+     * the caret edit stays last and the reaction stays idle (its own edit
+     * would have dragged the caret onto a later line).
+     * @returns {null|{start:number,end:number,text:string,pre?:{start:number,end:number,text:string}}}
      */
     function indentPlan (text, a, b, direction, settings, caret) {
       const unit = settings.indentUnit
@@ -430,16 +499,11 @@ window.__ModuleLoader__.load({
         if (items[k] !== null) { any = true; break }
       }
       if (!any) return null
-      // Extend to the whole list block so sibling markers re-number too —
-      // but for a collapsed caret stop at its line: the rest renumbers via
-      // the auto-renumber reaction, and the replacement must end at the
-      // caret so insertText keeps the caret among the content characters.
+      // Extend to the whole list block so sibling markers re-number too.
       let i = a
       while (i > 0 && items[i - 1] !== null) i -= 1
       let j = last
-      if (caret === undefined) {
-        while (j + 1 < lines.length && items[j + 1] !== null) j += 1
-      }
+      while (j + 1 < lines.length && items[j + 1] !== null) j += 1
       const shifted = lines.slice()
       for (let k = a; k <= last; k++) {
         const it = items[k]
@@ -448,29 +512,46 @@ window.__ModuleLoader__.load({
           ? ' '.repeat(unit) + lines[k]
           : lines[k].slice(Math.min(unit, it.indentLen))
       }
-      const { out } = renumberLines(shifted, i, j, settings, true)
+      // ONE pass over the block: lines up to the caret line are restyled as
+      // an explicit level change (single items and bullets included); the
+      // later ones get exactly what the auto-renumber reaction would settle
+      // on, so nothing is left for it to do.
+      const { out } = renumberLines(shifted, i, j, settings, caret === undefined ? true : last)
       // A plan that would not change a single line (e.g. outdent at top
       // level with an already-normalized marker) must stay native so Tab
       // keeps its focus-move meaning instead of firing a no-op edit.
       let touched = false
-      for (let k = i; k <= j; k += 1) {
+      for (let k = i; k <= last; k += 1) {
         if (out[k] !== lines[k]) { touched = true; break }
       }
       if (!touched) return null
-      if (caret !== undefined) {
-        // Caret-scoped plan: the last line carries the new prefix plus the
-        // SAME content offset the caret had, and the replacement ends at the
-        // caret — insertText then parks it exactly there.
-        const lastStart = lineRange(text, last, last).start
-        const oldEnd = lastStart + markerEndOf(lines[last])
-        const contentOffset = Math.max(0, caret - oldEnd)
-        const newEnd = markerEndOf(out[last])
-        const pieces = []
-        for (let k = i; k < last; k++) pieces.push(out[k])
-        pieces.push(out[last].slice(0, Math.min(out[last].length, newEnd + contentOffset)))
-        return { start: lineRange(text, i, i).start, end: Math.max(caret, oldEnd), text: pieces.join('\n') }
+      if (caret === undefined) return markerScopePlan(text, i, j, out)
+      // Caret-scoped plan: the last line carries the new prefix plus the
+      // SAME content offset the caret had, and the replacement ends at the
+      // caret — insertText then parks it exactly there. Clamp the caret to
+      // its line so an off-line value can never pull a whole neighbour line
+      // into the replacement.
+      const lastStart = lineRange(text, last, last).start
+      const lastEnd = lineRange(text, last, last).end
+      const caretOnLine = Math.min(Math.max(caret, lastStart), lastEnd)
+      const oldEnd = lastStart + markerEndOf(lines[last])
+      const contentOffset = Math.max(0, caretOnLine - oldEnd)
+      const newEnd = markerEndOf(out[last])
+      const pieces = []
+      for (let k = i; k < last; k++) pieces.push(out[k])
+      pieces.push(out[last].slice(0, Math.min(out[last].length, newEnd + contentOffset)))
+      const plan = { start: lineRange(text, i, i).start, end: Math.max(caretOnLine, oldEnd), text: pieces.join('\n') }
+      // Later siblings (beyond `last`, restyled reaction-style by the same pass).
+      let firstTrail = -1
+      let lastTrail = -1
+      for (let k = last + 1; k <= j; k += 1) {
+        if (out[k] !== lines[k]) {
+          if (firstTrail < 0) firstTrail = k
+          lastTrail = k
+        }
       }
-      return markerScopePlan(text, i, j, out)
+      if (firstTrail >= 0) plan.pre = markerScopePlan(text, firstTrail, lastTrail, out)
+      return plan
     }
 
     /**
@@ -516,37 +597,119 @@ window.__ModuleLoader__.load({
       }
       // Continue with the current line's own style: the next marker feels
       // right even when the user hand-wrote a non-default style at this level.
+      // A number too large for exact arithmetic (22+ digits) restarts at 1
+      // instead of rendering scientific notation ("1e+22. ").
+      const nextNumber = Number.isSafeInteger(it.num) ? it.num + 1 : 1
       const core = it.ordered
-        ? renderOrderedCore(it.style, (it.num ?? 0) + 1)
+        ? renderOrderedCore(it.style, nextNumber)
         : it.bullet
       const insert = '\n' + it.indent + core + ' '
       return { consume: true, plan: { start: caretStart, end: Math.max(caretEnd, caretStart), text: insert }, exited: false }
     }
 
     /**
-     * Marker fix for the line that FOLLOWED an exited empty item: when that
-     * adjacent line was an ordered item and the exit leaves it as a
-     * single-item block whose number no longer starts the block (a lone
-     * "3. b" under the blank), rewrite it to the level's first marker.
-     * Content-driven renumbering skips single-item blocks by design (a lone
-     * hand-numbered line must stay untouched), so the exit path asks for
-     * this targeted fix itself. Computed on the PRE-edit text.
-     * @returns {null|{start:number,end:number,text:string}}
+     * The edits that apply `plan` to `text` together with the renumbering it
+     * causes, ordered so the caret ends where the user expects it. insertText
+     * always parks the caret at the END of the inserted text, so the edit
+     * that must own the caret is applied LAST:
+     *
+     *   main  — covers everything from the first renumbered line before the
+     *           caret up to the caret itself. Applying it lands the caret on
+     *           the same content character it would have had without the
+     *           renumbering. Its span ends at plan.end, so `text` coordinates
+     *           stay valid whatever was applied before it.
+     *   right — renumbering that lies after the caret (plus nothing else),
+     *           in `text` coordinates, rightmost first. Applied BEFORE main.
+     *
+     * `lone` optionally names the line (in the post-plan text) of a leftover
+     * single-item block whose marker restarts at 1 — the item an exit left
+     * under the blank line. `known` is that renumber plan when the caller
+     * already computed it (the reaction does), saving a second full pass.
+     * @param {{start:number,end:number,text:string}} plan
+     * @returns {{main:{start:number,end:number,text:string}, right:{start:number,end:number,text:string}[]}}
      */
-    function exitTailFixPlan (text, caret, settings) {
-      const lines = text.split('\n')
-      const next = lineIndexOf(text, caret) + 1
-      const it = lines[next] === undefined ? null : parseItem(lines[next])
-      if (it === null || !it.ordered) return null
-      let e = next
-      while (e + 1 < lines.length && parseItem(lines[e + 1]) !== null) e += 1
-      if (e > next) return null // multi-item tail block: renumberPlan already covers it
-      const level = Math.min(LEVELS - 1, levelOf(it.indentLen, Math.max(2, settings.indentUnit)))
-      const core = renderOrderedCore(settings.orderedStyles[level], 1)
-      if (core === lines[next].slice(it.indentLen, it.coreLen)) return null
-      const out = lines.slice()
-      out[next] = it.indent + core + ' ' + it.rest.replace(/^[ \t]/, '')
-      return markerScopePlan(text, next, next, out)
+    function caretAnchoredEdits (text, plan, settings, lone, known) {
+      const A = text.slice(0, plan.start) + plan.text + text.slice(plan.end)
+      const C = plan.start + plan.text.length // where insertText leaves the caret
+      const right = []
+      let main = plan
+      const renum = known !== undefined ? known : renumberPlan(A, settings, lone)
+      if (renum !== null) {
+        const T = A.slice(0, renum.start) + renum.text + A.slice(renum.end)
+        const aLines = A.split('\n')
+        const tLines = T.split('\n')
+        // The caret's offset inside its own line survives the renumbering
+        // even when that line's marker changes length or style: strictly
+        // inside the old marker it keeps its offset (capped by the new one),
+        // at the marker's end or past it the content offset is what is kept.
+        const k = lineIndexOf(A, C)
+        const inLine = C - lineStarts(aLines)[k]
+        const startT = lineStarts(tLines)[k]
+        const oldPrefix = markerEndOf(aLines[k])
+        const newPrefix = markerEndOf(tLines[k])
+        const caretT = Math.min(T.length, inLine < oldPrefix
+          ? startT + Math.min(inLine, newPrefix)
+          : startT + newPrefix + (inLine - oldPrefix))
+        if (renum.start < C) {
+          const from = Math.min(renum.start, plan.start)
+          main = { start: from, end: plan.end, text: T.slice(from, caretT) }
+        }
+        if (renum.end > C) {
+          const delta = plan.text.length - (plan.end - plan.start)
+          const endT = T.length - (A.length - renum.end)
+          right.push({ start: plan.end, end: renum.end - delta, text: T.slice(caretT, endT) })
+        }
+      }
+      right.sort((p, q) => q.start - p.start)
+      return { main, right }
+    }
+
+    /**
+     * The auto-renumber reaction's edits for `plan`, keeping the caret where
+     * the user's own edit left it (`caret`, a detect offset of `text`).
+     *   - Something renumbered lies left of the caret: the main edit ends at
+     *     the caret, the rest is applied first (see caretAnchoredEdits).
+     *   - The caret sits ON the first renumbered line's start — or on the
+     *     line break right before it, which is where deleting a whole line
+     *     leaves it: one edit renumbers the range and parks the caret at
+     *     its END (the block's tail); a second, content-neutral edit — the
+     *     first line's new marker rewritten with itself, the Home/⌘←
+     *     branch's mechanism — brings it back right after that line's marker.
+     *     It changes no text, so it costs no revision and no undo step.
+     *   - The caret sits elsewhere before the range: only the first edit
+     *     applies.
+     * @returns {{start:number,end:number,text:string}[]} applied in order;
+     *   each one's coordinates are valid after the previous ones landed
+     */
+    function reactionEdits (text, plan, settings, caret) {
+      if (caret > plan.start && caret <= text.length) {
+        const { main, right } = caretAnchoredEdits(text, { start: caret, end: caret, text: '' }, settings, undefined, plan)
+        return [...right, main]
+      }
+      const onRangeStart = caret === plan.start
+        || (caret === plan.start - 1 && text.charAt(caret) === '\n')
+      if (!onRangeStart) return [plan]
+      const T = text.slice(0, plan.start) + plan.text + text.slice(plan.end)
+      const tLines = T.split('\n')
+      const a = lineIndexOf(text, plan.start)
+      const prefix = markerEndOf(tLines[a])
+      // Coordinates are in the draft AFTER `plan` applied (same start: the
+      // range begins here, and its line keeps its index).
+      return [plan, { start: plan.start, end: plan.start + prefix, text: tLines[a].slice(0, prefix) }]
+    }
+
+    /**
+     * Line (in the post-exit text) of the item an empty-item exit left under
+     * its blank line — the first non-empty line at or after the caret's.
+     * Undefined when nothing follows. The renumber pass restarts that line's
+     * marker at 1 when it is a lone ordered item ("3. b" → "1. b").
+     */
+    function exitLoneLine (afterText, caret) {
+      const lines = afterText.split('\n')
+      for (let m = lineIndexOf(afterText, caret); m < lines.length; m += 1) {
+        if (lines[m].trim() !== '') return m
+      }
+      return undefined
     }
 
     /**
@@ -644,9 +807,10 @@ window.__ModuleLoader__.load({
      * marker): the line loses one indent unit, its marker restyles for the
      * shallower level, and the preceding list lines renumber to match. The
      * replacement scope stops at THIS line's marker so the caret lands right
-     * after the promoted marker on the same line; any following siblings are
-     * left to the auto-renumber reaction.
-     * @returns {null|{start:number,end:number,text:string}}
+     * after the promoted marker on the same line. Later siblings converge the
+     * way the auto-renumber reaction would through `plan.pre` — applied
+     * first by the caller, so the caret edit stays last.
+     * @returns {null|{start:number,end:number,text:string,pre?:{start:number,end:number,text:string}}}
      */
     function promotePlan (text, caret, settings) {
       const unit = Math.max(2, settings.indentUnit)
@@ -658,8 +822,23 @@ window.__ModuleLoader__.load({
       shifted[lineIdx] = lines[lineIdx].slice(Math.min(unit, it.indentLen))
       let i = lineIdx
       while (i > 0 && parseItem(lines[i - 1]) !== null) i -= 1
-      const { out } = renumberLines(shifted, i, lineIdx, settings, true)
-      return markerScopePlan(text, i, lineIdx, out)
+      let j = lineIdx
+      while (j + 1 < lines.length && parseItem(lines[j + 1]) !== null) j += 1
+      // One pass: lines up to this one restyle as the explicit level change
+      // they are; the later siblings get what the auto-renumber reaction
+      // would settle on (they ride on plan.pre).
+      const { out } = renumberLines(shifted, i, j, settings, lineIdx)
+      const plan = markerScopePlan(text, i, lineIdx, out)
+      let firstTrail = -1
+      let lastTrail = -1
+      for (let k = lineIdx + 1; k <= j; k += 1) {
+        if (out[k] !== lines[k]) {
+          if (firstTrail < 0) firstTrail = k
+          lastTrail = k
+        }
+      }
+      if (firstTrail >= 0) plan.pre = markerScopePlan(text, firstTrail, lastTrail, out)
+      return plan
     }
 
     /**
@@ -685,6 +864,38 @@ window.__ModuleLoader__.load({
     // ------------------------------------------------------------------
 
     const CONTENTEDITABLE_SELECTOR = '[contenteditable="true"]'
+    /**
+     * Host InputBar markers: the composer card (`data-composer-card`) and its
+     * own text surface (`data-composer-input`). The key handler is a
+     * document-level capture listener, so it must know WHICH editable is its
+     * composer: the page may hold other contenteditable elements (another
+     * plugin's editor, an inline rename field, a second composer instance).
+     */
+    const COMPOSER_CARD_SELECTOR = '[data-composer-card]'
+    const COMPOSER_INPUT_SELECTOR = '[data-composer-input]'
+    /**
+     * Property (on the composer card) naming the runtime instance that
+     * drives it. A registry symbol so it is shared ACROSS module instances:
+     * a slot registered twice (a local copy next to the npm package) is two
+     * closures, and both must not answer one key event.
+     */
+    const DRIVER = Symbol.for('dsh.composer-lists.driver')
+    /** How long after Cmd+Z / the Edit menu a draft change may count as history navigation. */
+    const HISTORY_NAV_WINDOW_MS = 2000
+
+    /**
+     * Whether any key branch may intercept this key. A cheap pre-filter so
+     * ordinary typing and unrelated shortcuts never reach the document-wide
+     * trigger-menu query.
+     */
+    function keyIsInterceptable (e) {
+      const key = e.key
+      if (key === 'Enter' || key === 'Backspace' || key === 'Tab' || key === 'Home'
+        || key === 'ArrowLeft' || key === 'ArrowRight') return true
+      return accelerated(e) && e.shiftKey && !e.altKey
+        && (key === 'b' || key === 'B' || key === '&' || key === '*'
+          || e.code === 'Digit7' || e.code === 'Numpad7' || e.code === 'Digit8' || e.code === 'Numpad8')
+    }
 
     /**
      * Text of one composer block with the detect projection's rules, rebuilt
@@ -719,20 +930,41 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The composer contenteditable this plugin drives. There is no rendered
-     * toolbar any more, so the anchor comes from key events (cached) or the
-     * document fallback used by the renumber pass.
+     * The composer contenteditable this plugin drives: cached from key
+     * events, resolved from the runtime's own composer card, or — without a
+     * known card — the first contenteditable in the document.
      */
     const editableState = { current: null }
 
-    function editableFromTarget (target) {
+    /**
+     * Whether `editable` is the composer the calling runtime belongs to.
+     * `scope` is `{card, editable}`; without a scope (pure tests) or when the
+     * host DOM is not recognised (`card === null`) every contenteditable is
+     * claimed, as before scoping.
+     */
+    function ownsEditable (editable, scope) {
+      if (scope === undefined || scope === null || scope.card === null) return true
+      return editable === scope.editable
+    }
+
+    function editableFromTarget (target, scope) {
       if (target === null || target === undefined || typeof target.closest !== 'function') return null
       const editable = target.closest(CONTENTEDITABLE_SELECTOR)
-      if (editable !== null) editableState.current = editable
+      // Never claim ANOTHER editor: its text paired with OUR caret
+      // coordinates would edit our draft at the wrong offsets.
+      if (editable === null || !ownsEditable(editable, scope)) return null
+      editableState.current = editable
       return editable
     }
 
-    function currentEditable () {
+    function currentEditable (scope) {
+      if (scope !== undefined && scope !== null && scope.card !== null) {
+        if (scope.editable !== null && scope.editable.isConnected) {
+          editableState.current = scope.editable
+          return scope.editable
+        }
+        return null // our composer's surface is gone: stay hands-off
+      }
       if (editableState.current !== null && editableState.current.isConnected) return editableState.current
       editableState.current = document.querySelector(CONTENTEDITABLE_SELECTOR)
       return editableState.current
@@ -836,10 +1068,18 @@ window.__ModuleLoader__.load({
       const t = text.replace(/\s/g, '')
       if (t.length < 6) return true
       if (!/[\u4e00-\u9fa5a-zA-Z]/.test(t)) return true
-      if (new Set(t).size <= 2) return true
-      if (/^(.)\1+$/.test(t)) return true
-      if (/^(.{1,4}?)\1{1,}$/.test(t)) return true
-      return false
+      // At most two distinct characters: a short-circuit scan, not a Set
+      // over the whole (up to 64 KB) input — this was the function's main cost.
+      const first = t.charAt(0)
+      let second = ''
+      for (let i = 1; i < t.length; i += 1) {
+        const ch = t.charAt(i)
+        if (ch === first || ch === second) continue
+        if (second === '') { second = ch; continue }
+        // A third distinct character: only the repetition patterns remain.
+        return /^(.)\1+$/.test(t) || /^(.{1,4}?)\1{1,}$/.test(t)
+      }
+      return true
     }
 
     function normalizeSettings (parsed) {
@@ -909,6 +1149,58 @@ window.__ModuleLoader__.load({
       const optimizingRef = useRef(false)
 
       /**
+       * WHICH composer this runtime belongs to: the host InputBar card its
+       * own button is rendered in, and that card's text surface. Resolved
+       * from the button's DOM position and cached while both stay connected.
+       * A scope with `card === null` means "host DOM not recognised" and
+       * falls back to the historical any-contenteditable lookups.
+       */
+      const rootRef = useRef(null)
+      const composerRef = useRef(null)
+      const resolveComposer = useCallback(() => {
+        const root = rootRef.current
+        // The lookup walks up to the card, so cache it — the MISS too (an
+        // unrecognised host DOM must not turn every key into a tree walk.
+        // A button re-mounted elsewhere (new root or new parent) re-resolves.
+        const parent = root !== null && root.isConnected ? root.parentNode : null
+        const cached = composerRef.current
+        if (cached !== null && cached.root === root && cached.parent === parent
+          && (cached.card === null || (cached.card.isConnected && cached.editable !== null && cached.editable.isConnected))) {
+          return cached
+        }
+        const card = root !== null && typeof root.closest === 'function' ? root.closest(COMPOSER_CARD_SELECTOR) : null
+        const editable = card !== null
+          ? (card.querySelector(COMPOSER_INPUT_SELECTOR) ?? card.querySelector(CONTENTEDITABLE_SELECTOR))
+          : null
+        const scope = { root, parent, card, editable }
+        composerRef.current = scope
+        return scope
+      }, [])
+      /** This instance's identity in the per-composer driver table. */
+      const token = useRef({})
+      /** Claim the composer for this instance; false when another one drives it. */
+      const claimComposer = useCallback((scope) => {
+        const card = scope === undefined || scope === null ? null : scope.card
+        if (card === null) return true
+        if (card[DRIVER] === undefined) card[DRIVER] = token
+        return card[DRIVER] === token
+      }, [])
+      /**
+       * History navigation the next draft change comes from: 'undo' /
+       * 'redo' when the user pressed Cmd/Ctrl+Z, Cmd+Shift+Z, Ctrl+Y or used
+       * the Edit menu (beforeinput historyUndo/historyRedo), else null. Any
+       * other key or input clears it. The renumber reaction must not answer
+       * an undo: the restored draft is exactly a state the user deliberately
+       * went back to, and re-fixing it would make Cmd+Z a no-op forever.
+       */
+      const historyNavRef = useRef(null)
+      const historyNavAtRef = useRef(0)
+      /** The reaction's own last transition, to recognise an undo of it. */
+      const lastReactionRef = useRef(null)
+      /** The surface locked while a prompt optimization is in flight. */
+      const lockRef = useRef(null)
+
+      /**
        * The live draft text rebuilt from the editor DOM. Keyboard handlers
        * read this instead of the React-published `InputState.draft`, which
        * lags one commit behind fast typing — the lag made a Shift+Enter right
@@ -926,7 +1218,7 @@ window.__ModuleLoader__.load({
        */
       const applyPlan = useCallback((plan, editable) => {
         if (plan === null || actionsRef.current === null) return false
-        const target = editable ?? currentEditable()
+        const target = editable ?? currentEditable(resolveComposer())
         const state = inputRef.current
         if (target === null || state === null) return false
         if (state.phase !== 'plain' && state.phase !== 'claimed') return false
@@ -937,7 +1229,7 @@ window.__ModuleLoader__.load({
           end: plan.end,
           draftRev: span.draftRev,
         })
-      }, [liveText])
+      }, [liveText, resolveComposer])
 
       /** Whole-line selection range + line indexes in live-DOM coordinates. */
       const selectionLines = useCallback((editable) => {
@@ -972,6 +1264,18 @@ window.__ModuleLoader__.load({
         // so a hot-reloaded/unmounted Runtime never touches the DOM again.
         let disposed = false
         let descentRaf = 0
+        /**
+         * Apply caret-anchored edits: the right-side ones first (rightmost
+         * first, all in text coordinates), the caret edit last — the edit
+         * applied last is where insertText parks the caret. Reports whether
+         * anything landed and whether the caret edit itself did.
+         */
+        const applyEdits = (edits, editable) => {
+          let applied = 0
+          for (const edit of edits.right) if (applyPlan(edit, editable)) applied += 1
+          const okMain = applyPlan(edits.main, editable)
+          return { any: okMain || applied > 0, okMain }
+        }
         // The composer is ONE paragraph whose line breaks are first literal
         // '\n' text and later — after the host's normalization pass — <br>
         // nodes; the selection the edit left behind maps to BEFORE the
@@ -986,7 +1290,7 @@ window.__ModuleLoader__.load({
           const step = () => {
             if (!exitPending || disposed || document.hidden || tries >= 20) return
             tries += 1
-            const editable = currentEditable()
+            const editable = currentEditable(resolveComposer())
             if (editable === null || !editable.isConnected) return
             const anchorBlock = domAnchorBlockIndex()
             if (anchorBlock < 0) { descentRaf = requestAnimationFrame(step); return }
@@ -1029,34 +1333,61 @@ window.__ModuleLoader__.load({
         }
         // TEMPORARY diagnostics removed (v1.2.0): the exit-caret bug was
         // located with per-Shift+Enter console logs and fixed.
+        /** The history chord the user pressed, if any: 'undo' | 'redo'. */
+        const historyNavOf = (e) => {
+          if (!(e.metaKey || e.ctrlKey) || e.altKey) return null
+          const lower = e.key.toLowerCase()
+          if (lower === 'z') return e.shiftKey ? 'redo' : 'undo'
+          if (lower === 'y' && e.ctrlKey) return 'redo'
+          return null
+        }
+        /**
+         * Keys aimed at the frozen composer while a prompt optimization is
+         * in flight. Every such key is swallowed and Escape aborts. This MUST
+         * run before the contenteditable lookup: the lock has already turned
+         * the surface contenteditable="false", so that lookup no longer
+         * matches it (Escape could never reach the abort).
+         */
+        const handleFrozenKey = (e) => {
+          const locked = lockRef.current !== null ? lockRef.current.editable : null
+          const inside = locked !== null && (e.target === locked
+            || (typeof locked.contains === 'function' && locked.contains(e.target)))
+          // Another editable holds the focus (a dialog input, another
+          // editor): its own Escape is none of our business.
+          const elsewhere = e.target !== null && e.target !== undefined
+            && typeof e.target.closest === 'function'
+            && e.target.closest('input, textarea, select, [contenteditable="true"]') !== null
+          if (!inside && !(e.key === 'Escape' && !elsewhere)) return false
+          if (e.key === 'Escape' && abortRef.current !== null) abortRef.current.abort()
+          e.preventDefault()
+          e.stopPropagation()
+          return true
+        }
         const onKey = (e) => {
           const state = inputRef.current
           const actions = actionsRef.current
           if (state === null || actions === null) return
           if (state.phase !== 'plain' && state.phase !== 'claimed') return
           if (composing(e)) return
-          const editable = editableFromTarget(e.target)
+          if (optimizingRef.current && handleFrozenKey(e)) return
+          const scope = resolveComposer()
+          if (!claimComposer(scope)) return
+          const editable = editableFromTarget(e.target, scope)
           if (editable === null) return
           if (e.key !== 'Enter'
             && (exitPendingClearingKey.test(e.key) || e.key.length === 1)) exitPending = false
           // Submit (plain Enter) clears the draft: the stale exitPending
           // must not leak into the next message's first Shift+Enter.
           if (e.key === 'Enter' && !e.shiftKey) exitPending = false
-          // While a prompt optimization is in flight the draft is frozen.
-          // Escape is the one escape hatch: it aborts the in-flight request
-          // so a hung model can never lock the composer for good.
-          if (optimizingRef.current) {
-            if (e.key === 'Escape' && abortRef.current !== null) {
-              e.preventDefault()
-              e.stopPropagation()
-              abortRef.current.abort()
-              return
-            }
-            e.preventDefault()
-            e.stopPropagation()
-            return
-          }
-          if (menuOpen()) return
+          // Remember an undo/redo chord: the draft change it is about to
+          // cause must not be answered by the renumber reaction. Every other
+          // key clears the signal.
+          historyNavRef.current = historyNavOf(e)
+          if (historyNavRef.current !== null) historyNavAtRef.current = Date.now()
+          // Only keys a branch below may intercept yield to an open trigger
+          // menu; every other key (plain typing, Cmd shortcuts) skips the
+          // document-wide menu query entirely.
+          if (keyIsInterceptable(e) && menuOpen()) return
 
           const key = e.key
           if (key === 'Enter' && e.shiftKey && !e.altKey && !accelerated(e)) {
@@ -1070,12 +1401,16 @@ window.__ModuleLoader__.load({
             // line's block ("user placed me at the list line's end").
             const anchorBlock = domAnchorBlockIndex()
             const sel = window.getSelection()
-            const anchorTextAfterContent = sel !== null && sel.isCollapsed
+            // seDecision consults this probe only to disambiguate a caret on
+            // a line break; anywhere else skip the block walk it costs.
+            const caretMin = Math.min(span.start, span.end)
+            const onLineBreak = caretMin > 0 && text.charAt(caretMin - 1) === '\n'
+            const anchorTextAfterContent = onLineBreak && sel !== null && sel.isCollapsed
               && sel.anchorNode !== null
               && sel.anchorNode.nodeType === Node.TEXT_NODE
               && sel.anchorOffset > 0
               && anchorBlock >= 0
-              && anchorBlock === blockIndexOfLine(editable, text, lineIndexOf(text, Math.min(span.start, span.end) - 1))
+              && anchorBlock === blockIndexOfLine(editable, text, lineIndexOf(text, caretMin - 1))
             const decision = seDecision(text, span.start, span.end, {
               anchorBlockEmpty: anchorBlock >= 0 && blockText(editable.children[anchorBlock]) === '',
               anchorTextAfterContent,
@@ -1093,49 +1428,21 @@ window.__ModuleLoader__.load({
               }
               return
             }
-            // Insert FIRST, preventDefault only once an edit landed — a
-            // refused edit (phase change / rev CAS) must never swallow the
-            // keypress.
-            // Pre-run the renumber the insertion will cause (mapped back
-            // into pre-insert coordinates), then insert LAST so the caret
-            // stays right after the new marker instead of at the renumbered
-            // tail. An exit additionally fixes a lone ordered tail item
-            // (single-item blocks are below renumberPlan's threshold).
+            // Apply the renumbering this insertion causes TOGETHER with it,
+            // caret edit LAST: insertText parks the caret at the end of the
+            // inserted text, so the edit that must own the caret goes last
+            // and everything right of it goes first. preventDefault only
+            // once an edit landed — a refused edit (phase change / rev CAS)
+            // must never swallow the keypress. An exit also restarts the
+            // lone ordered item it leaves under the blank line.
             const afterText = text.slice(0, plan.start) + plan.text + text.slice(plan.end)
-            const renum = renumberPlan(afterText, settingsRef.current)
-            const tail = exited ? exitTailFixPlan(text, Math.min(span.start, span.end), settingsRef.current) : null
-            const pre = renum !== null && renum.start >= plan.start + plan.text.length ? renum : tail
-            if (pre !== null) {
-              const delta = plan.text.length - (plan.end - plan.start)
-              // renum lives in POST-plan coordinates (mapped back by delta);
-              // tail was computed on the PRE-edit text and needs no shift.
-              const shifted = pre === tail ? pre : {
-                text: pre.text,
-                start: pre.start - delta,
-                end: pre.end - delta,
-              }
-              const applied = actions.insertText(shifted.text, {
-                start: shifted.start, end: shifted.end, draftRev: span.draftRev,
-              })
-              if (applied) {
-                e.preventDefault()
-                e.stopPropagation()
-                const span2 = actions.captureInsertion()
-                if (span2 === undefined) {
-                  console.error('[composer-lists] caret span lost between edits; main edit skipped')
-                  return
-                }
-                exitPending = exited && actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span2.draftRev })
-                if (exitPending) queueCaretDescent()
-                return
-              }
-            }
-            const okPlain = actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span.draftRev })
-            if (okPlain) {
+            const lone = exited ? exitLoneLine(afterText, plan.start + plan.text.length) : undefined
+            const landed = applyEdits(caretAnchoredEdits(text, plan, settingsRef.current, lone), editable)
+            if (landed.any) {
               e.preventDefault()
               e.stopPropagation()
             }
-            exitPending = exited && okPlain
+            exitPending = exited && landed.okMain
             if (exitPending) queueCaretDescent()
             return
           }
@@ -1145,52 +1452,40 @@ window.__ModuleLoader__.load({
             const text = liveText(editable)
             if (text === null) return
             const { consume, plan: bsPlan, mode, fallback } = backspacePlan(text, span.start, settingsRef.current)
-            let plan = bsPlan
             if (!consume) return
-            // Insert FIRST, preventDefault only once an edit landed (see the
+            // Edits land first, preventDefault only once one did (see the
             // Shift+Enter branch). Promote may fall back to the plain plan.
-            let consumed = false
+            let landed
             if (mode === 'promote') {
-              // Level deletion: the plan already renormalizes the block up to
-              // this line, and its marker scope drops the caret right after
-              // the promoted marker on the same line. Later siblings renumber
-              // through the auto-renumber reaction.
-              if (applyPlan(plan, editable)) {
-                e.preventDefault()
-                e.stopPropagation()
-                return
-              }
-              // The edit was refused (phase change / rev CAS): never swallow
-              // the key — fall back to the plain marker deletion.
-              console.error('[composer-lists] promote edit refused; falling back to plain marker deletion')
-              if (fallback !== undefined) plan = fallback
-            }
-            // Same renumber-first ordering as Enter: the deletion runs last
-            // so the caret lands on the deletion point.
-            const afterText = text.slice(0, plan.start) + text.slice(plan.end)
-            const renum = renumberPlan(afterText, settingsRef.current)
-            if (renum !== null && renum.start >= plan.start) {
-              const delta = plan.end - plan.start
-              const applied = actions.insertText(renum.text, {
-                start: renum.start + delta, end: renum.end + delta, draftRev: span.draftRev,
-              })
-              if (applied) {
-                consumed = true
-                const span2 = actions.captureInsertion()
-                if (span2 === undefined) {
-                  console.error('[composer-lists] caret span lost between edits; main edit skipped')
+              // Level promotion: the plan renormalizes the block up to this
+              // line and its scope drops the caret right after the promoted
+              // marker; later siblings ride on plan.pre (applied first).
+              landed = applyEdits({ main: bsPlan, right: bsPlan.pre === undefined ? [] : [bsPlan.pre] }, editable)
+              if (!landed.okMain) {
+                // The caret edit was refused (phase change / rev CAS): never
+                // swallow the key — fall back to the plain marker deletion.
+                console.error('[composer-lists] promote edit refused; falling back to plain marker deletion')
+                if (fallback === undefined) {
+                  if (landed.any) {
+                    e.preventDefault()
+                    e.stopPropagation()
+                  }
                   return
                 }
-                const okMain = actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span2.draftRev })
-                if (okMain) {
-                  e.preventDefault()
-                  e.stopPropagation()
+                if (landed.any) {
+                  // The trailing renumber already landed; it lies after this
+                  // line, so the plain plan's coordinates are still intact.
+                  landed = { any: true, okMain: applyPlan(fallback, editable) }
+                } else {
+                  landed = applyEdits(caretAnchoredEdits(text, fallback, settingsRef.current), editable)
                 }
-                return
               }
+            } else {
+              // The deletion runs LAST so the caret lands on the deletion
+              // point; the renumbering it causes is folded around the caret.
+              landed = applyEdits(caretAnchoredEdits(text, bsPlan, settingsRef.current), editable)
             }
-            const okBs = actions.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: span.draftRev })
-            if (okBs || consumed) {
+            if (landed.any) {
               e.preventDefault()
               e.stopPropagation()
             }
@@ -1272,7 +1567,9 @@ window.__ModuleLoader__.load({
             const plan = indentPlan(sel.text, sel.a, sel.b, e.shiftKey ? -1 : 1, settingsRef.current,
               sel.collapsed ? Math.max(sel.span.start, sel.span.end) : undefined)
             if (plan === null) return // no item lines: keep native Tab
-            if (!applyPlan(plan, editable)) return // edit refused: keep native Tab
+            // Later siblings renumber first (plan.pre); the caret edit last.
+            const landed = applyEdits({ main: plan, right: plan.pre === undefined ? [] : [plan.pre] }, editable)
+            if (!landed.any) return // edit refused: keep native Tab
             e.preventDefault()
             e.stopPropagation()
             return
@@ -1301,25 +1598,34 @@ window.__ModuleLoader__.load({
           }
         }
         const onBeforeInput = (e) => {
-          if (!optimizingRef.current) return
-          if (e.target instanceof Node && editableState.current !== null
+          if (optimizingRef.current
+            && e.target instanceof Node && editableState.current !== null
             && editableState.current.contains(e.target)) {
             e.preventDefault()
           }
+          // The Edit menu's undo/redo arrives as a beforeinput event; any
+          // other input means the next draft change is a real edit.
+          const type = e.inputType
+          historyNavRef.current = type === 'historyUndo' ? 'undo' : type === 'historyRedo' ? 'redo' : null
+          if (historyNavRef.current !== null) historyNavAtRef.current = Date.now()
         }
         const onPointerDown = () => { exitPending = false }
+        // One driver per composer: a slot registered twice (local + npm copy)
+        // must not let two instances answer the same key event.
+        const { card } = resolveComposer()
+        if (!claimComposer({ card, editable: null })) return
         document.addEventListener('keydown', onKey, true)
         document.addEventListener('beforeinput', onBeforeInput, true)
         document.addEventListener('pointerdown', onPointerDown, true)
         return () => {
           disposed = true
+          if (card !== null && card[DRIVER] === token) delete card[DRIVER]
           if (descentRaf !== 0) cancelAnimationFrame(descentRaf)
           document.removeEventListener('keydown', onKey, true)
           document.removeEventListener('beforeinput', onBeforeInput, true)
           document.removeEventListener('pointerdown', onPointerDown, true)
         }
-      }, [applyPlan, selectionLines, liveText])
-
+      }, [applyPlan, selectionLines, liveText, resolveComposer, claimComposer])
       // Automatic renumbering after content changes.
       useEffect(() => {
         const prev = prevDraftRef.current
@@ -1327,15 +1633,42 @@ window.__ModuleLoader__.load({
         if (!settingsRef.current.autoRenumber) return
         if (input === null || input.phase !== 'plain') return
         if (input.occurrences.length > 0) return
-        const editable = currentEditable()
+        const scope = resolveComposer()
+        if (!claimComposer(scope)) return // another instance drives this composer
+        const editable = currentEditable(scope)
         if (editable === null) return
         if (detectTextOf(editable) !== input.draft) return
         if (input.draft.startsWith('>') || input.draft.includes('\n> ')) return // quote node may be present
         if (prev !== undefined && onlyMarkerEdit(prev, input.draft)) return
+        // An undo walks back to a draft that existed before — exactly the
+        // state the user wants. Re-fixing it would redo the undone edit and
+        // make Cmd+Z a no-op forever (the reaction's own edit sits on top of
+        // the user's in the undo stack). Redo is left alone: it re-converges.
+        const nav = historyNavRef.current
+        historyNavRef.current = null
+        const last = lastReactionRef.current
+        const undoing = (nav === 'undo' && Date.now() - historyNavAtRef.current < HISTORY_NAV_WINDOW_MS)
+          || (last !== null && prev === last.to && input.draft === last.from)
+        if (undoing) {
+          lastReactionRef.current = null
+          return
+        }
+        const actions = actionsRef.current
+        if (actions === null) return
         const plan = renumberPlan(input.draft, settingsRef.current)
         if (plan === null) return
-        actionsRef.current?.insertText(plan.text, { start: plan.start, end: plan.end, draftRev: input.draftRev })
-      }, [input?.draft, input?.draftRev, input?.phase, input?.occurrences])
+        // Keep the caret where the user's edit left it instead of at the end
+        // of the renumbered range: apply the reaction caret-anchored too.
+        const span = actions.captureInsertion()
+        const caret = span !== undefined && span.start === span.end ? span.start : plan.start
+        for (const edit of reactionEdits(input.draft, plan, settingsRef.current, caret)) {
+          if (!applyPlan(edit, editable)) return
+        }
+        lastReactionRef.current = {
+          from: input.draft,
+          to: input.draft.slice(0, plan.start) + plan.text + input.draft.slice(plan.end),
+        }
+      }, [input?.draft, input?.draftRev, input?.phase, input?.occurrences, resolveComposer, claimComposer, applyPlan])
 
       const gearRef = useRef(null)
       const openSettings = useCallback(() => {
@@ -1375,29 +1708,37 @@ window.__ModuleLoader__.load({
       const undoable = original !== null && optimized !== null && input !== null && input.draft === optimized
       const optimize = useCallback(async () => {
         const state = inputRef.current
-        const actions = actionsRef.current
-        if (state === null || actions === null || optimizing) return
+        if (state === null || actionsRef.current === null) return
+        // The ref guards re-entry (not the render-time `optimizing`): two
+        // clicks landing before React re-renders must not start two flights.
+        if (optimizingRef.current) return
         if (state.phase !== 'plain' && state.phase !== 'claimed') return
         const text = state.draft
         if (text.trim() === '') return
         if (meaninglessText(text)) {
           setOptimizeError('tooShort')
-          setToast(t('tooShort'))
+          setToast(tRef.current('tooShort'))
           return
         }
         if (state.occurrences.length > 0) {
           setOptimizeError('toastChips')
-          setToast(t('toastChips'))
+          setToast(tRef.current('toastChips'))
           return
         }
+        // A new flight retires the previous one's error and toast.
+        setOptimizeError(null)
+        setToast(null)
         optimizingRef.current = true
         setOptimizing(true)
         // Freeze the editor at the browser level: IME composition events
         // (insertCompositionText) are not cancelable, so keydown/beforeinput
         // interception alone cannot stop typing. Toggle contenteditable and
-        // restore exactly the element we locked.
-        const locked = currentEditable()
+        // restore exactly the element (and attribute value) we locked.
+        const locked = currentEditable(resolveComposer())
         if (locked !== null) {
+          // The host owns editability and may have made the surface
+          // read-only meanwhile: put back what was there, not a hard "true".
+          lockRef.current = { editable: locked, previous: locked.getAttribute('contenteditable') }
           locked.setAttribute('contenteditable', 'false')
           locked.classList.add('clp-optimizing')
         }
@@ -1420,36 +1761,46 @@ window.__ModuleLoader__.load({
           }
           // The editor is locked, so any draft change during the flight
           // (session switch, external restore) means this rewrite no longer
-          // belongs in the composer — drop it instead of clobbering.
-          if (inputRef.current !== null && inputRef.current.draft !== text) {
-            setToast(t('cancelled'))
+          // belongs in the composer — drop it instead of clobbering. Read
+          // the actions at result time so they pair with the state compared.
+          if (inputRef.current === null || actionsRef.current === null || inputRef.current.draft !== text) {
+            setToast(tRef.current('cancelled'))
             return
           }
           setOriginal(text)
           setOptimized(data.text)
-          actions.setDraft(data.text)
+          actionsRef.current.setDraft(data.text)
         } catch (error) {
-          console.error('[composer-lists] optimize failed:', error)
           const aborted = error !== null && typeof error === 'object' && error.name === 'AbortError'
+          if (!aborted) console.error('[composer-lists] optimize failed:', error)
           const message = aborted
-            ? (timedOut ? t('timeout') : t('cancelled'))
+            ? (timedOut ? tRef.current('timeout') : tRef.current('cancelled'))
             : error instanceof Error ? error.message : String(error)
           setOptimizeError(message)
-          setToast(t('optimizeFailed') + ': ' + message)
+          setToast(tRef.current('optimizeFailed') + ': ' + message)
         } finally {
           clearTimeout(timer)
           abortRef.current = null
-          if (locked !== null && locked.isConnected) {
-            locked.setAttribute('contenteditable', 'true')
-            locked.classList.remove('clp-optimizing')
+          const lock = lockRef.current
+          lockRef.current = null
+          if (lock !== null && lock.editable.isConnected) {
+            lock.editable.setAttribute('contenteditable', lock.previous === null ? 'true' : lock.previous)
+            lock.editable.classList.remove('clp-optimizing')
           }
           optimizingRef.current = false
           setOptimizing(false)
         }
-      }, [optimizing])
+      }, [])
+      // Unmounting mid-flight (session switch, plugin disabled): abort the
+      // orphan request, so its own finally unlocks the resident surface now
+      // instead of when the hard timeout fires.
+      useEffect(() => () => { if (abortRef.current !== null) abortRef.current.abort() }, [])
       const restore = useCallback(() => {
         const actions = actionsRef.current
-        if (actions === null || original === null) return
+        const state = inputRef.current
+        if (actions === null || state === null || original === null) return
+        // Never swap the draft of a frozen composer (a submission in flight).
+        if (state.phase !== 'plain' && state.phase !== 'claimed') return
         actions.setDraft(original)
         setOriginal(null)
         setOptimized(null)
@@ -1467,7 +1818,7 @@ window.__ModuleLoader__.load({
         : optimizeError === 'tooShort' ? t('tooShort')
           : optimizeError
 
-      return h('div', { class: 'clp-root' },
+      return h('div', { class: 'clp-root', ref: rootRef },
         h('style', null, `${CSS}\n:root { --clp-opt-text: ${JSON.stringify(t('optimizing'))}; }`),
         settings.showOptimize && h('button', {
           type: 'button',
@@ -1889,7 +2240,7 @@ window.__ModuleLoader__.load({
       _pure: {
         parseItem, renderOrderedCore, renumberPlan, onlyMarkerEdit, togglePlan, indentPlan,
         continuationPlan, backspacePlan, promotePlan, arrowJump, lineBounds, lineRange,
-        lineIndexOf, meaninglessText, seDecision, exitTailFixPlan,
+        lineIndexOf, meaninglessText, seDecision, caretAnchoredEdits, reactionEdits, exitLoneLine,
       },
     }
   },

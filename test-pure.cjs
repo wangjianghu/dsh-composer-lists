@@ -669,24 +669,242 @@ eq(apply('1. \n\n\n', P.continuationPlan('1. \n\n\n', 3, 3, SETTINGS).plan), '',
   const r = P.continuationPlan('1. a\n2. \n3. b', 5, 10, SETTINGS)
   eq(r.plan.end >= 10, true, 'exit replaces a selection extending past the blank run')
 }
-eq(apply('1. a\n2. \n3. b', P.exitTailFixPlan('1. a\n2. \n3. b', 8, SETTINGS)), '1. a\n2. \n1. b', 'lone ordered tail renumbers to 1.')
-eq(P.exitTailFixPlan('1. a\n2. \n3. b\n4. c', 8, SETTINGS), null, 'multi-item tail left to renumberPlan')
-eq(P.exitTailFixPlan('1. a\n2. \n\n9. x', 8, SETTINGS), null, 'blank-separated standalone number untouched')
-eq(P.exitTailFixPlan('1. a\n- \n- x', 8, SETTINGS), null, 'bullet tail needs no renumber')
-eq(P.exitTailFixPlan('1. a\n2. \n1. b', 8, SETTINGS), null, 'already-correct lone tail is a no-op')
+// --- the exit's lone tail restarts inside the Shift+Enter edit set ---
+// (replaces the former exitTailFixPlan helper: the fix now rides the same
+// caret-anchored renumber pass, so it can never leave a residual edit)
 {
-  // End-to-end: exit + tail fix compose into the final draft.
-  const exitPlan = P.continuationPlan('1. a\n2. \n3. b', 8, 8, SETTINGS).plan
-  const tail = P.exitTailFixPlan('1. a\n2. \n3. b', 8, SETTINGS)
-  const afterExit = apply('1. a\n2. \n3. b', exitPlan)
-  const delta = exitPlan.text.length - (exitPlan.end - exitPlan.start)
-  eq(apply(afterExit, { ...tail, start: tail.start + delta, end: tail.end + delta }),
-    '1. a\n\n\n1. b', 'exit + tail fix yields blank + caret line + renumbered tail')
+  const text = '1. a\n2. \n3. b'
+  const plan = P.continuationPlan(text, 8, 8, SETTINGS).plan
+  const after = apply(text, plan)
+  const edits = P.caretAnchoredEdits(text, plan, SETTINGS, P.exitLoneLine(after, plan.start + plan.text.length))
+  eq(edits.right.length, 1, 'exit: the lone tail rides as a right edit')
+  eq(edits.main, plan, 'exit: the caret edit is the exit itself')
+  const out = apply(apply(text, edits.right[0]), edits.main)
+  eq(out, '1. a\n\n\n1. b', 'exit: lone ordered tail restarts at 1.')
+  eq(edits.main.start + edits.main.text.length, 6, 'exit: caret rests on the empty line')
+  eq(P.renumberPlan(out, SETTINGS), null, 'exit: the reaction has nothing left')
 }
+{
+  // Earlier AND later lines converge around the caret in ONE gesture (the
+  // old either/or pick dropped one of them and the reaction dragged the
+  // caret back onto an earlier line).
+  const text = '1. a\n① f\n  1. \na. d'
+  const plan = P.continuationPlan(text, 14, 14, SETTINGS).plan
+  const after = apply(text, plan)
+  const edits = P.caretAnchoredEdits(text, plan, SETTINGS, P.exitLoneLine(after, plan.start + plan.text.length))
+  const out = apply(apply(text, edits.right[0]), edits.main)
+  eq(out, '1. a\n2. f\n\n\n1. d', 'exit: earlier and later lines converge')
+  eq(edits.main.start + edits.main.text.length, 11, 'exit: caret stays on the empty line')
+  ok(edits.right[0].start >= edits.main.end, 'exit: right edit never overlaps the caret edit')
+}
+{
+  // An already-correct lone tail adds no edit.
+  const text = '1. a\n2. \n1. b'
+  const plan = P.continuationPlan(text, 8, 8, SETTINGS).plan
+  const after = apply(text, plan)
+  const edits = P.caretAnchoredEdits(text, plan, SETTINGS, P.exitLoneLine(after, plan.start + plan.text.length))
+  eq([edits.right.length, edits.main], [0, plan], 'exit: correct lone tail needs no edit')
+  eq(apply(text, edits.main), '1. a\n\n\n1. b', 'exit: correct lone tail stays')
+}
+
+// --- caret-anchored edits: Shift+Enter on a hand-written style line ---
+{
+  const text = '- f\n1) m'
+  const plan = P.continuationPlan(text, 8, 8, SETTINGS).plan
+  const edits = P.caretAnchoredEdits(text, plan, SETTINGS)
+  eq(edits.right.length, 0, 'SE: nothing trails the caret')
+  eq(edits.main, { start: 4, end: 8, text: '1. m\n2. ' }, 'SE: the earlier line folds into the caret edit')
+  eq(apply(text, edits.main), '- f\n1. m\n2. ', 'SE: hand-written "1)" converges')
+  eq(edits.main.start + edits.main.text.length, 12, 'SE: caret lands on the NEW line, after its marker')
+}
+{
+  // A lone letter-style item becomes 1./2. with ONE edit (was two, the
+  // second one pulling the caret to the text end).
+  const text = 'a. x'
+  const plan = P.continuationPlan(text, 4, 4, SETTINGS).plan
+  const edits = P.caretAnchoredEdits(text, plan, SETTINGS)
+  eq([edits.right.length, edits.main], [0, { start: 0, end: 4, text: '1. x\n2. ' }], 'SE: lone letter item converges in the caret edit')
+  eq(edits.main.start + edits.main.text.length, 8, 'SE: caret right after the new marker')
+}
+{
+  // Later items shift through the right edit; the caret edit is the plan.
+  const text = '1. a\n2. c'
+  const plan = P.continuationPlan(text, 4, 4, SETTINGS).plan
+  const edits = P.caretAnchoredEdits(text, plan, SETTINGS)
+  eq(edits.right, [{ start: 4, end: 8, text: '\n3. ' }], 'SE: the later item shifts first')
+  eq(edits.main, plan, 'SE: the plan itself is applied last')
+  eq(apply(apply(text, edits.right[0]), edits.main), '1. a\n2. \n3. c', 'SE: mid-list continuation lands')
+  eq(edits.main.start + edits.main.text.length, 8, 'SE: caret on the new line')
+}
+
+// --- toggle OFF: a stripped line may still read as an item ---
+eq(apply('- - x', P.togglePlan('- - x', 0, 0, 'bullet', SETTINGS, 4).plan), '- x', 'toggle off: the inner marker is content, not duplicated')
+eq(apply('- 1. a', P.togglePlan('- 1. a', 0, 0, 'bullet', SETTINGS, 5).plan), '1. a', 'toggle off: inner ordered marker kept once')
+eq(apply('- 1. a', P.togglePlan('- 1. a', 0, 0, 'bullet', SETTINGS).plan), '1. a', 'toggle off (selection): inner ordered marker kept once')
+eq(apply('- - x', P.togglePlan('- - x', 0, 0, 'bullet', SETTINGS).plan), '- x', 'toggle off (selection): not a dead key any more')
+eq(apply('- 1. a', P.togglePlan('- 1. a', 0, 0, 'bullet', SETTINGS, 2).plan), '1. a', 'toggle off: caret right after the outer marker')
+eq(apply('- 5. a', P.togglePlan('- 5. a', 0, 0, 'bullet', SETTINGS).plan), '5. a', 'toggle off: a lone hand number stays')
+// Caret right after the OUTER marker of a doubly-marked line: the inner marker is
+// rewritten and the content behind the caret survives (it used to be swallowed).
+eq(apply('  * * b', P.togglePlan('  * * b', 0, 0, 'bullet', SETTINGS, 4).plan), '  * b', 'toggle off (caret after outer marker): content behind the caret survives')
+eq(apply('- 1. b', P.togglePlan('- 1. b', 0, 0, 'bullet', SETTINGS, 2).plan), '1. b', 'toggle off (caret after outer marker): inner number kept')
+eq(apply('- - x\n- - y', P.togglePlan('- - x\n- - y', 1, 1, 'bullet', SETTINGS, 9).plan), '- - x\n- y', 'toggle off (caret mid-block): one line only')
+eq(apply('- 5. a\n- 6. b', P.togglePlan('- 5. a\n- 6. b', 0, 1, 'bullet', SETTINGS).plan), '1. a\n2. b', 'toggle off: inner numbers converge in the same edit')
+{
+  const text = '- 5. a\n- 6. b'
+  const { pre, plan } = P.togglePlan(text, 1, 1, 'bullet', SETTINGS, 10)
+  eq([pre, apply(text, plan)], [null, '- 5. a\n1. b'], 'toggle off (caret): inner marker converges under the caret')
+  eq(plan.start + plan.text.length, 10, 'toggle off (caret): caret keeps its content offset')
+}
+
+// --- onlyMarkerEdit: whole-line changes are not hand marker edits ---
+eq(P.onlyMarkerEdit('1. a\n2. c', '1. a\nb. x\n2. c'), false, 'pasting a whole item line is not a hand marker edit')
+eq(P.onlyMarkerEdit('1. a\n2. c', '1. a\n5. x\n2. c'), false, 'pasting a numbered line is not a hand marker edit')
+eq(P.onlyMarkerEdit('1. a\n2. b\n3. c', '1. a\n3. c'), false, 'deleting a whole line is not a hand marker edit')
+eq(P.onlyMarkerEdit('1. a\n2. b', '1. a\n2. b\n3. c'), false, 'adding a trailing item line is not a hand marker edit')
+eq(P.onlyMarkerEdit('1. a\n2. b', '1. a\n3. b'), true, 'hand digit edit is still suspended')
+
+// --- Tab / promote: later siblings converge through `pre` ---
+{
+  const text = '1. a\n2. b\n3. c'
+  const plan = P.indentPlan(text, 1, 1, 1, SETTINGS, 9)
+  eq(apply(text, plan), '1. a\n  a. b\n3. c', 'caret Tab: the plan still ends at the caret')
+  eq(plan.pre, { start: 10, end: 13, text: '2. ' }, 'caret Tab: the later sibling renumbers through pre')
+  ok(plan.pre.start >= plan.end, 'caret Tab: pre never overlaps the caret edit')
+  eq(apply(apply(text, plan.pre), plan), '1. a\n  a. b\n2. c', 'caret Tab: pre + plan')
+  eq(P.renumberPlan(apply(apply(text, plan.pre), plan), SETTINGS), null, 'caret Tab: the reaction stays idle')
+  const back = P.indentPlan('1. a\n  a. b\n2. c', 1, 1, -1, SETTINGS, 11)
+  eq(apply(apply('1. a\n  a. b\n2. c', back.pre), back), '1. a\n2. b\n3. c', 'caret Shift+Tab: pre + plan')
+  eq(back.pre, { start: 12, end: 15, text: '3. ' }, 'caret Shift+Tab: the later sibling shifts through pre')
+  const last = P.indentPlan(text, 2, 2, 1, SETTINGS, 14)
+  eq(last.pre, undefined, 'caret Tab on the last item needs no pre')
+}
+{
+  // An off-line caret must never pull a neighbour line into the replacement.
+  const plan = P.indentPlan('• w\n  1. l\n(99) deep', 0, 1, 1, SETTINGS, 16)
+  eq(apply('• w\n  1. l\n(99) deep', plan), '  * w\n    ① l\n(99) deep', 'caret Tab: off-line caret is clamped to its line')
+}
+{
+  const text = '1. a\n  b. x\n  c. y'
+  const plan = P.promotePlan(text, 8, SETTINGS)
+  eq(apply(text, plan), '1. a\n2. x\n  c. y', 'promote: the plan stops at the caret line')
+  eq(plan.pre, { start: 12, end: 17, text: '  a. ' }, 'promote: the later sibling renumbers through pre')
+  ok(plan.pre.start >= plan.end, 'promote: pre never overlaps the caret edit')
+  eq(apply(apply(text, plan.pre), plan), '1. a\n2. x\n  a. y', 'promote: pre + plan')
+  eq(P.renumberPlan(apply(apply(text, plan.pre), plan), SETTINGS), null, 'promote: the reaction stays idle')
+  eq(P.promotePlan('1. a\n  b. ', 9, SETTINGS).pre, undefined, 'promote: no later sibling, no pre')
+}
+
+// --- reaction edits: the renumber keeps the caret on the user's line ---
+{
+  const text = '1. a\n3. c\n4. d'
+  const plan = P.renumberPlan(text, SETTINGS)
+  eq(P.reactionEdits(text, plan, SETTINGS, 4), [plan, { start: 5, end: 8, text: '2. ' }], 'reaction: caret on the line break before the range → renumber, then re-park after the FIRST marker')
+  eq(P.reactionEdits(text, plan, SETTINGS, 5)[1].start + 3, 8, 'reaction: caret on the range start parks after the first marker')
+  eq(P.reactionEdits(text, plan, SETTINGS, 2), [plan], 'reaction: a caret before the range does not re-park')
+  const tail = '1. a\n3. c\n4. d\nplain'
+  const plan2 = P.renumberPlan(tail, SETTINGS)
+  const edits2 = P.reactionEdits(tail, plan2, SETTINGS, 19)
+  eq(edits2.length, 1, 'reaction: a caret past the range lands in ONE edit')
+  eq(apply(tail, edits2[0]), '1. a\n2. c\n3. d\nplain', 'reaction: text converges')
+  eq(edits2[0].start + edits2[0].text.length, 19, 'reaction: the caret keeps its content offset')
+}
+
+// --- huge hand-written numbers never render scientific notation ---
+eq(P.continuationPlan('9'.repeat(21) + '. x', 24, 24, SETTINGS).plan.text, '\n1. ', 'huge hand number continues from 1, not "1e+22."')
 {
   // Out-of-range spans are clamped, never produce out-of-bounds plans.
   const r = P.seDecision('1. a', 999, 999, { anchorBlockEmpty: false, anchorTextAfterContent: false }, false, SETTINGS)
   eq(r.plan.start <= 4 && r.plan.end <= 4 + r.plan.text.length, true, 'clamped span stays in bounds')
+}
+
+// ====================================================================
+// Edit-set properties: every gesture is a set of edits (right ones first,
+// the caret edit last). With CJK content the typed characters are exactly
+// the CJK run, so content conservation is checkable character by character:
+//   - no gesture ever loses or duplicates a typed character;
+//   - right edits are in bounds, follow the caret edit, never overlap it;
+//   - the caret edit ends inside the resulting draft;
+//   - the draft is converged afterwards (the reaction has nothing to do —
+//     its own edit would have moved the caret).
+// ====================================================================
+{
+  let seed = 20261123
+  const rnd = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0
+    return seed / 2 ** 32
+  }
+  const PIECES = ['', ' ', '1. 甲', '2. 乙', '9. 丙', 'a. 丁', 'b. 戊', 'α. 己', '(3) 庚', '① 辛', '3) 壬',
+    '- 癸', '* 子', '• 丑', 'plain 寅', '- - 卯', '1. 2. 辰', '- 1. 巳', '- - * 未', '- 1. 2. 午', '  - - 子', '- 5. 丑', '  1. 午', '    - 未', '\t1. 申', '5.', '- ']
+  const content = text => (text.match(/[\u4e00-\u9fa5]/g) ?? []).join('')
+  const inBounds = (text, plan) => plan !== null && plan !== undefined && Number.isInteger(plan.start)
+    && Number.isInteger(plan.end) && plan.start >= 0 && plan.end <= text.length && plan.start <= plan.end
+    && typeof plan.text === 'string'
+  const applySet = (text, edits, label) => {
+    if (edits.right === undefined || edits.main === undefined || edits.main === null) { ok(false, `${label} shape`); return null }
+    let cursor = text
+    let sane = true
+    for (const right of edits.right) {
+      if (!inBounds(cursor, right) || right.start < edits.main.end) sane = false
+      else cursor = apply(cursor, right)
+    }
+    if (!sane || !inBounds(cursor, edits.main)) { ok(false, `${label} bounds/overlap ${JSON.stringify(edits)}`); return null }
+    const out = apply(cursor, edits.main)
+    if (edits.main.start + edits.main.text.length > out.length) { ok(false, `${label} caret past the end`); return null }
+    return out
+  }
+  const preList = plan => (plan !== null && plan !== undefined && plan.pre !== undefined ? [plan.pre] : [])
+  const ROUNDS = 600
+  let gestures = 0
+  for (let n = 0; n < ROUNDS; n += 1) {
+    const lineCount = 1 + Math.floor(rnd() * 7)
+    const lines = []
+    for (let i = 0; i < lineCount; i += 1) lines.push(PIECES[Math.floor(rnd() * PIECES.length)])
+    const text = lines.join('\n')
+    const caret = Math.floor(rnd() * (text.length + 1))
+    const before = content(text)
+    let threw = null
+    try {
+      // Tab only touches its own block: an un-converged neighbour block (the
+      // random input) stays as it was, so convergence is asserted for inputs
+      // that were converged to begin with.
+      const check = (out, label, blockOnly = false) => {
+        if (out === null) return
+        if (blockOnly && P.renumberPlan(text, SETTINGS) !== null) return
+        gestures += 1
+        ok(content(out) === before, `${label} keeps every typed character (${JSON.stringify(text)})`,
+          `  before ${before} after ${content(out)} via ${JSON.stringify(out)}`)
+        ok(P.renumberPlan(out, SETTINGS) === null, `${label} converged`, `  left ${JSON.stringify(P.renumberPlan(out, SETTINGS))} in ${JSON.stringify(out)}`)
+      }
+      const se = P.seDecision(text, caret, caret, { anchorBlockEmpty: false, anchorTextAfterContent: false }, false, SETTINGS)
+      if (se.kind === 'insert' && se.renum) {
+        const plan = se.plan
+        const after = apply(text, plan)
+        const lone = se.exited ? P.exitLoneLine(after, plan.start + plan.text.length) : undefined
+        check(applySet(text, P.caretAnchoredEdits(text, plan, SETTINGS, lone), `set SE #${n}`), `set SE #${n}`)
+      }
+      const bs = P.backspacePlan(text, caret, SETTINGS)
+      if (bs.consume) {
+        // Like Tab, a promotion renumbers its own block only.
+        const edits = bs.mode === 'promote'
+          ? { main: bs.plan, right: preList(bs.plan) }
+          : P.caretAnchoredEdits(text, bs.plan, SETTINGS)
+        check(applySet(text, edits, `set BS #${n}`), `set BS #${n}`, bs.mode === 'promote')
+      }
+      const line = P.lineIndexOf(text, caret)
+      const ip = P.indentPlan(text, line, line, rnd() < 0.5 ? 1 : -1, SETTINGS, caret)
+      if (ip !== null) check(applySet(text, { main: ip, right: preList(ip) }, `set Tab #${n}`), `set Tab #${n}`, true)
+      const lo = Math.floor(rnd() * lines.length)
+      const hi = Math.floor(rnd() * lines.length)
+      const tp = P.togglePlan(text, Math.min(lo, hi), Math.max(lo, hi), rnd() < 0.5 ? 'bullet' : 'ordered', SETTINGS,
+        rnd() < 0.5 ? undefined : caret)
+      check(applySet(text, { main: tp.plan, right: tp.pre === null ? [] : [tp.pre] }, `set toggle #${n}`), `set toggle #${n}`)
+    } catch (error) {
+      threw = error
+    }
+    ok(threw === null, `set no throw #${n} (${JSON.stringify(text)})`, String(threw && threw.stack))
+  }
+  console.log(`ok   edit-set properties ×${ROUNDS} drafts (${gestures} gestures: conservation, bounds, convergence)`)
 }
 
 if (failures > 0) {

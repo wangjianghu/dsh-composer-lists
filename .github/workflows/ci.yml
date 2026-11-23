@@ -20,6 +20,8 @@ jobs:
         run: node --check client.js && node --check index.js
       - name: Pure-logic suite (regression + fuzz)
         run: node test-pure.cjs
+      - name: Runtime key-sequence suite (real Runtime component)
+        run: node test-runtime.cjs
       - name: Host-route integration suite
         run: node test-host.cjs
       - name: Benchmarks (smoke)

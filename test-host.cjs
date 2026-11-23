@@ -1,8 +1,9 @@
 // Host-half integration tests: load the ESM index.js, capture the registered
 // optimize route, and drive its handler with fake req/res transports —
-// covering the happy path, the max-tokens retry, guards, and disconnects.
+// covering the happy path, retries, guards, disconnects, and resource discipline.
 const path = require('path')
 const { pathToFileURL } = require('url')
+const { mock } = require('node:test')
 
 let failures = 0
 let passes = 0
@@ -47,16 +48,6 @@ function fakeRes () {
   }
 }
 
-/** Async iterable of stream chunks. */
-function streamOf (chunks) {
-  return {
-    [Symbol.asyncIterator]() {
-      let i = 0
-      return { next: async () => (i < chunks.length ? { done: false, value: chunks[i++] } : { done: true }) }
-    },
-  }
-}
-
 async function main () {
   const mod = await import(pathToFileURL(path.join(__dirname, 'index.js')).href)
 
@@ -85,9 +76,13 @@ async function main () {
   const calls = []
   const lastOptions = () => calls[calls.length - 1]
 
-  /** Install a fresh llm fake and reset the call log. */
+  /**
+   * Install a fresh llm fake and reset the call log. `onIterator` wraps the
+   * fake iterator (to stall it or make return() reject); `onClose` counts
+   * return() calls.
+   */
   let providerSeq = 0
-  const useLlm = ({ chunksByCall, resolveInfo, providers, delayMs = 0 } = {}) => {
+  const useLlm = ({ chunksByCall, resolveInfo, providers, delayMs = 0, onIterator, onClose } = {}) => {
     calls.length = 0
     providerSeq += 1
     // A distinct provider per test keeps the module-level effort cache from
@@ -101,17 +96,19 @@ async function main () {
       stream (options) {
         calls.push(options)
         const chunks = chunksByCall === undefined ? [] : (typeof chunksByCall === 'function' ? chunksByCall(calls.length) : chunksByCall)
-        if (delayMs <= 0) return streamOf(chunks)
-        return {
-          [Symbol.asyncIterator]() {
-            let i = 0
-            return {
-              next: () => new Promise((resolve) => {
-                setTimeout(() => resolve(i < chunks.length ? { done: false, value: chunks[i++] } : { done: true }), delayMs)
-              }),
-            }
+        let i = 0
+        const step = () => (i < chunks.length ? { done: false, value: chunks[i++] } : { done: true })
+        const base = {
+          next: delayMs <= 0
+            ? async () => step()
+            : () => new Promise((resolve) => { setTimeout(() => resolve(step()), delayMs) }),
+          return () {
+            if (onClose !== undefined) onClose()
+            return Promise.resolve({ done: true })
           },
         }
+        const iterator = onIterator === undefined ? base : onIterator(base)
+        return { [Symbol.asyncIterator]() { return iterator } }
       },
     }
   }
@@ -334,6 +331,161 @@ async function main () {
     const { res, parsed } = await run({ body: bodyOf(TEXT) })
     eq(res.status, 500, 'stream error 500')
     eq(parsed?.error, 'upstream blew up', 'error message surfaced')
+  }
+
+  // ==================================================================
+  // Resource discipline: cancellation, stream closing, truncated output.
+  // ==================================================================
+  const unhandled = []
+  const onUnhandled = (reason) => { unhandled.push(String((reason && reason.message) ?? reason)) }
+  process.on('unhandledRejection', onUnhandled)
+  const settle = () => new Promise((resolve) => setImmediate(() => setImmediate(resolve)))
+  try {
+    // 15. Every stream call carries a caller cancellation signal, untouched
+    //     on the normal path (the reply is written and the stream closed).
+    let returned = 0
+    useLlm({
+      chunksByCall: () => [{ type: 'text-delta', text: '正常 内容' }, { type: 'finish', reason: 'stop' }],
+      onClose: () => { returned += 1 },
+    })
+    {
+      const { res } = await run({ body: bodyOf(TEXT) })
+      eq(res.status, 200, 'normal path status 200')
+      ok(lastOptions().signal instanceof AbortSignal, 'every stream call passes a cancellation signal')
+      eq(lastOptions().signal.aborted, false, 'normal path leaves the signal intact')
+      eq(returned, 1, 'normal path closes the stream iterator')
+    }
+
+    // 16. The browser disconnects mid-stream → the PROVIDER request is
+    //     cancelled too (not just abandoned), no reply is written.
+    useLlm({
+      delayMs: 25,
+      chunksByCall: () => [{ type: 'text-delta', text: 'partial' }, { type: 'finish', reason: 'stop' }],
+      onClose: () => { returned += 1 },
+    })
+    {
+      returned = 0
+      const res = fakeRes()
+      const handling = route.handler(fakeReq({ body: bodyOf(TEXT) }), res)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      res.close()
+      await handling
+      eq(res.state.ended, false, 'disconnect writes no reply')
+      eq(calls[0].signal.aborted, true, 'disconnect aborts the provider request')
+      eq(returned, 1, 'disconnect closes the stream iterator')
+    }
+
+    // 17. A stalled provider stream: the step deadline cancels the provider
+    //     request and fails the request instead of hanging the handler.
+    {
+      mock.timers.enable({ apis: ['setTimeout'] })
+      useLlm({ chunksByCall: () => [{ type: 'text-delta', text: 'partial' }, { type: 'finish', reason: 'stop' }], onIterator: () => ({
+        next: () => new Promise(() => {}), // never resolves: the provider stalled
+        return () { returned += 1; return Promise.resolve({ done: true }) },
+      }) })
+      returned = 0
+      const handling = run({ body: bodyOf(TEXT) })
+      await new Promise((resolve) => setImmediate(resolve))
+      mock.timers.tick(120_000)
+      const { res, parsed } = await handling
+      mock.timers.reset()
+      eq(res.status, 500, 'stalled stream fails with 500')
+      eq(parsed?.error, 'model stream timed out', 'stalled stream reports the timeout')
+      eq(calls[0].signal.aborted, true, 'stalled stream aborts the zombie provider request')
+      eq(returned, 1, 'stalled stream closes the iterator')
+    }
+
+    // 18. An adapter whose stream cancellation REJECTS must not produce an
+    //     unhandled rejection (that takes the whole Host process down).
+    {
+      let returnedRejecting = 0
+      useLlm({
+        chunksByCall: () => [{ type: 'text-delta', text: '好 内容' }, { type: 'finish', reason: 'stop' }],
+        onIterator: (inner) => ({
+          next: inner.next,
+          return () { returnedRejecting += 1; return Promise.reject(new Error('iterator.return() failed (adapter cancel error)')) },
+        }),
+      })
+      const { res } = await run({ body: bodyOf(TEXT) })
+      await settle()
+      eq(res.status, 200, 'a rejecting return() does not fail the request')
+      eq(returnedRejecting, 1, 'return() was still attempted')
+      eq(unhandled.length, 0, `no unhandledRejection (got ${JSON.stringify(unhandled)})`)
+    }
+
+    // 19. Partial output that did not finish cleanly is NEVER a success: a
+    //     truncated rewrite must not replace the user's whole draft.
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '1. 只写到一半的目标' }, { type: 'finish', reason: { kind: 'error', message: 'boom' } }] })
+    {
+      const { res, parsed } = await run({ body: bodyOf(TEXT) })
+      eq(res.status, 502, 'partial output + error finish is 502 (was 200 with the truncated text)')
+      ok((parsed?.error ?? '').startsWith('generation stopped: error: boom'), 'partial output: readable reason')
+      eq(parsed?.ok, false, 'partial output: no ok payload')
+      eq(calls.length, 1, 'partial output + error: no retry')
+    }
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '1. 被截断' }, { type: 'finish', reason: { kind: 'max-tokens' } }] })
+    {
+      const { res, parsed } = await run({ body: bodyOf(TEXT) })
+      eq(JSON.stringify([res.status, calls.length, calls[1]?.maxTokens]), JSON.stringify([502, 2, 8192]), 'partial output + max-tokens retries once at 8192, then 502')
+      eq(parsed?.text, undefined, 'truncated text is never returned')
+    }
+    useLlm({
+      chunksByCall: (n) => n === 1
+        ? [{ type: 'text-delta', text: '1. 被截断' }, { type: 'finish', reason: { kind: 'max-tokens' } }]
+        : [{ type: 'text-delta', text: '完整的 重写' }, { type: 'finish', reason: 'stop' }],
+    })
+    {
+      const { res, parsed } = await run({ body: bodyOf(TEXT) })
+      eq(JSON.stringify([res.status, parsed?.text]), JSON.stringify([200, '完整的 重写']), 'truncated first attempt, complete retry → the retry wins')
+    }
+
+    // 20. Retry branches key on the finish KIND, never on the message text.
+    useLlm({ chunksByCall: () => [{ type: 'finish', reason: { kind: 'error', message: 'upstream said max-tokens-not-supported' } }] })
+    {
+      const { res, parsed } = await run({ body: bodyOf(TEXT) })
+      eq(JSON.stringify([res.status, calls.length]), JSON.stringify([502, 1]), 'a message merely CONTAINING "max-tokens" does not trigger the 8192 retry')
+      eq(parsed?.error, 'generation stopped: error: upstream said max-tokens-not-supported', 'kind + message still reported')
+    }
+    useLlm({ chunksByCall: () => [{ type: 'finish', reason: { kind: 'tool_calls' } }] })
+    {
+      const { res, parsed } = await run({ body: bodyOf(TEXT) })
+      eq(JSON.stringify([res.status, calls.length]), JSON.stringify([502, 2]), 'an underscore "tool_calls" kind gets the no-tools retry too')
+      ok((parsed?.error ?? '').includes('已重试一次仍失败'), 'underscore kind: descriptive failure after the retry')
+    }
+
+    // 21. A duplicated Origin header (array form) fails closed.
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '同源 内容' }, { type: 'finish', reason: 'stop' }] })
+    eq((await run({ headers: { origin: ['http://127.0.0.1:9999', 'http://evil.example'], host: '127.0.0.1:9999' }, body: bodyOf(TEXT) })).res.status, 403, 'array Origin header refused')
+
+    // 22. Model-info resolve: a fast rejection clears its 3 s race timer
+    //     (a leaked timer kept the process alive), and concurrent first-time
+    //     requests share one lookup.
+    {
+      const timers = new Set()
+      const cleared = new Set()
+      const realSet = global.setTimeout
+      const realClear = global.clearTimeout
+      global.setTimeout = (fn, ms, ...rest) => { const id = realSet(fn, ms, ...rest); if (ms === 3000) timers.add(id); return id }
+      global.clearTimeout = (id, ...rest) => { cleared.add(id); return realClear(id, ...rest) }
+      try {
+        useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '好 内容' }, { type: 'finish', reason: 'stop' }], resolveInfo: new Error('boom') })
+        await run({ body: bodyOf(TEXT) })
+        ok(timers.size === 1 && cleared.has([...timers][0]), 'fast resolve rejection clears its race timer')
+        eq(lastOptions().signal.aborted, false, '(sanity) request completed normally')
+        // Concurrent first miss: one shared lookup.
+        let resolves = 0
+        useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '并发 内容' }, { type: 'finish', reason: 'stop' }] })
+        fakeCtx.llm.resolveModelInfo = async () => { resolves += 1; await new Promise((resolve) => realSet(resolve, 20)); return { reasoning: { efforts: [{ id: 'low', name: 'Low' }] } } }
+        await Promise.all([run({ body: bodyOf(TEXT) }), run({ body: bodyOf(TEXT) }), run({ body: bodyOf(TEXT) }), run({ body: bodyOf(TEXT) })])
+        eq(resolves, 1, 'concurrent first-time requests share one resolveModelInfo')
+        ok(calls.every(options => options.reasoningEffort === 'low'), 'every concurrent request still gets the resolved effort')
+      } finally {
+        global.setTimeout = realSet
+        global.clearTimeout = realClear
+      }
+    }
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
   }
 
   if (failures > 0) {
