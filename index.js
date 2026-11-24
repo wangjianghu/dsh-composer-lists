@@ -24,6 +24,11 @@
  * request running as a zombie), and the stream iterator is closed on every
  * exit path with its rejection handled (an unhandled one takes the Host
  * process down).
+ *
+ * Stream protocol (dsh-llm 0.2.2): a call yields `text-delta` chunks for the
+ * visible answer (reasoning and tool-call deltas are ignored), then `usage`
+ * and one terminal `finish` chunk whose `reason` is an OBJECT keyed by
+ * `kind`. See decodeFinish for the shapes; test-host.cjs replays them.
  */
 export const inject = ['llm']
 
@@ -68,32 +73,68 @@ async function withTimeout (promise, ms, message) {
 }
 
 /**
- * Readable failure for a finish reason that is not 'stop'. Adapters hand
- * either a string or an object ({ kind, message }).
+ * Finish kinds that mean "the model completed the answer": only then may the
+ * rewrite replace the draft.
  */
-function finishFailure (reason) {
-  if (typeof reason === 'string') return reason
-  if (reason !== null && typeof reason === 'object') {
-    if (reason.message !== undefined && reason.message !== '') {
-      return `${reason.kind ?? 'error'}: ${reason.message}`
-    }
-    return String(reason.kind ?? reason.type ?? JSON.stringify(reason))
+const COMPLETE_KINDS = new Set(['stop', 'end-turn', 'stop-sequence'])
+
+/**
+ * Decode the reason of one `finish` chunk into `{ kind, detail }`.
+ *
+ * DSH adapters ALWAYS end a stream with `usage` then `finish`, and the reason
+ * is an OBJECT (dsh-llm 0.2.2 `FinishReasonMap`; the pi-ai adapter's
+ * `mapStopReason` yields exactly these):
+ *
+ *   { kind: 'stop' }                   normal completion
+ *   { kind: 'max-tokens' }             output limit reached: the text is cut off
+ *   { kind: 'tool-calls' }             the model asked for tools instead of text
+ *   { kind: 'aborted', failure }       cancelled
+ *   { kind: 'error', failure }         provider / transport / empty response
+ *
+ * `failure` is an LlmFailure ({ message, code, status? }): the details live
+ * THERE, not in `reason.message`. Comparing the reason with the STRING 'stop'
+ * (1.3.x and 1.4.0) took every normal completion for a failure, and 1.4.0
+ * then rejected each rewrite with "generation stopped: stop (partial output
+ * discarded)". A string reason is still accepted defensively; a kind this
+ * plugin does not know is never a success. Retry branches key on `kind` —
+ * never on the message text, where a sentence like "upstream said
+ * max-tokens-not-supported" would trigger the wrong retry.
+ *
+ * @returns {{kind: string, detail: string}} `kind` is '' when the reason
+ *   could not be read at all
+ */
+function decodeFinish (reason) {
+  const norm = (value) => String(value ?? '').trim().toLowerCase().replace(/_/g, '-')
+  if (typeof reason === 'string') {
+    const kind = norm(reason)
+    return { kind, detail: kind === '' ? 'unknown finish reason' : kind }
   }
-  return 'unknown'
+  if (reason !== null && typeof reason === 'object') {
+    const kind = norm(reason.kind ?? reason.type)
+    const failure = reason.failure
+    const message = typeof failure?.message === 'string' && failure.message.trim() !== ''
+      ? failure.message.trim()
+      : typeof reason.message === 'string' ? reason.message.trim() : ''
+    const code = typeof failure?.code === 'string' ? failure.code.trim() : ''
+    const parts = [kind === '' ? 'unknown' : kind]
+    if (code !== '' && norm(code) !== kind) parts.push(code)
+    if (message !== '') parts.push(message)
+    return { kind, detail: parts.join(': ') }
+  }
+  return { kind: '', detail: 'unknown finish reason' }
 }
 
 /**
- * The adapter's own classification of a failure ('max-tokens',
- * 'tool-calls', …): the part before the message, normalized. Retry branches
- * key on THIS — never on the whole text, where a message like "upstream said
- * max-tokens-not-supported" would trigger the wrong retry.
+ * Current default model selection, or — when no default is configured — the
+ * first model of the first registered provider.
+ *
+ * Shapes follow dsh-llm 0.2.2: `listProviders()` returns `[{ id, name }]`
+ * (routes carry NO model list) and the models of one route come from the
+ * async `listModels(provider)` as `[{ provider, id, name }]`. The 1.x
+ * fallback read a `models` array off the provider entry, which never
+ * existed: without a default selection every request answered 503.
  */
-function finishKind (failure) {
-  return failure.split(':')[0].trim().toLowerCase().replace(/_/g, '-')
-}
-
-/** Current default model selection, or a first-provider fallback. */
-function modelSelection (ctx) {
+async function modelSelection (ctx) {
   const defaults = ctx.get('agentDefaultModel')
   if (defaults !== undefined) {
     try {
@@ -102,12 +143,12 @@ function modelSelection (ctx) {
     } catch { /* fall through to the provider fallback */ }
   }
   try {
-    const providers = ctx.llm.listProviders()
-    const first = providers[0]
-    if (first === undefined) return null
-    const model = Array.isArray(first.models) ? (first.models[0]?.id ?? first.models[0]) : undefined
+    const first = ctx.llm.listProviders()[0]
+    const provider = typeof first?.id === 'string' ? first.id : undefined
+    if (provider === undefined) return null
+    const model = (await ctx.llm.listModels(provider))[0]?.id
     if (typeof model !== 'string') return null
-    return { provider: first.provider ?? first.id, model }
+    return { provider, model }
   } catch {
     return null
   }
@@ -216,10 +257,6 @@ export function apply (ctx) {
           if (meaninglessText(text)) {
             return reply(400, { ok: false, error: '文本过短或无意义，无优化价值 (text too short or meaningless to optimize)' })
           }
-          const selection = modelSelection(ctx)
-          if (selection === null) {
-            return reply(503, { ok: false, error: 'no model provider configured' })
-          }
           // Stop early when the browser side disconnects (its own timeout or
           // Escape abort) — and cancel the provider request with it.
           let clientGone = false
@@ -228,6 +265,11 @@ export function apply (ctx) {
             clientGone = true
             if (activeAbort !== null) activeAbort.abort()
           })
+          const selection = await modelSelection(ctx)
+          if (selection === null) {
+            return reply(503, { ok: false, error: 'no model provider configured' })
+          }
+          if (clientGone) return
           // The rewrite needs no thinking: use the route's lightest declared
           // effort instead of the user's global (possibly heavy) selection.
           const lightEffort = await lightestEffort(ctx, selection.provider, selection.model)
@@ -236,7 +278,8 @@ export function apply (ctx) {
             const controller = new AbortController()
             activeAbort = controller
             let out = ''
-            let failure = ''
+            // 'none' = the stream ended without a finish chunk.
+            let finish = { kind: 'none', detail: 'no finish reason' }
             const iterator = ctx.llm.stream({
               provider: selection.provider,
               model: selection.model,
@@ -260,16 +303,17 @@ export function apply (ctx) {
                   controller.abort() // a stall or an adapter error: cancel upstream
                   throw error
                 }
-                if (clientGone) return { aborted: true, out: '', failure: '' }
+                if (clientGone) return { aborted: true, out: '', kind: 'none', detail: '' }
                 if (step.done) break
                 const chunk = step.value
                 if (chunk.type === 'text-delta') {
+                  // Only visible text: reasoning deltas and tool-call
+                  // deltas are not the rewrite.
                   out += chunk.text
-                } else if (chunk.type === 'finish' && chunk.reason !== 'stop') {
-                  // Any finish but 'stop' is a failure, partial text
-                  // included: a truncated or errored rewrite must never be
-                  // handed to the client as if it were complete.
-                  failure = finishFailure(chunk.reason)
+                } else if (chunk.type === 'finish') {
+                  // Whatever the kind, keep streaming to the end so the
+                  // iterator closes normally; the decision comes afterwards.
+                  finish = decodeFinish(chunk.reason)
                 }
               }
             } finally {
@@ -281,33 +325,37 @@ export function apply (ctx) {
               const closed = iterator.return?.()
               if (closed !== undefined && typeof closed.catch === 'function') closed.catch(() => {})
             }
-            return { aborted: false, out, failure }
+            return { aborted: false, out, kind: finish.kind, detail: finish.detail }
           }
           let result = await runStream(4096)
           // Never retry after the browser side is gone (its own timeout or
           // Escape abort already freed the client). One retry, branched by
-          // the finish reason:
+          // the finish KIND:
           //  - max-tokens: a force-thinking model burned the whole budget on
           //    reasoning, or the rewrite was cut off; retry from scratch with
           //    a doubled ceiling.
           //  - tool-calls with no text at all: the model ignored the hint;
           //    retry once with an explicit no-tools nudge in the system prompt.
-          const kind = finishKind(result.failure)
-          if (!result.aborted && !clientGone && result.failure !== '' && kind.includes('max-tokens')) {
+          const live = () => !result.aborted && !clientGone
+          if (live() && result.kind === 'max-tokens') {
             result = await runStream(8192)
-          } else if (!result.aborted && !clientGone && result.out.trim() === '' && kind.includes('tool-calls')) {
+          } else if (live() && result.kind === 'tool-calls' && result.out.trim() === '') {
             result = await runStream(4096, SYSTEM_PROMPT + NO_TOOL_NUDGE)
-            if (!result.aborted && !clientGone && result.out.trim() === '' && finishKind(result.failure).includes('tool-calls')) {
-              result = { aborted: false, out: '', failure: 'tool-calls（模型选择调用工具而非输出文本，已重试一次仍失败）' }
+            if (!result.aborted && !clientGone && result.out.trim() === '' && result.kind === 'tool-calls') {
+              result = { ...result, detail: 'tool-calls（模型选择调用工具而非输出文本，已重试一次仍失败）' }
             }
           }
           if (result.aborted || clientGone) return
           const trimmed = result.out.trim()
+          // Complete only on an explicit "stop" (or when no finish chunk came
+          // at all and there is text). A truncated or errored rewrite must
+          // never be handed to the client as if it were complete.
+          const complete = result.kind === 'none' || COMPLETE_KINDS.has(result.kind)
           if (trimmed === '') {
-            return reply(502, { ok: false, error: result.failure === '' ? 'empty model response' : `generation stopped: ${result.failure}` })
+            return reply(502, { ok: false, error: complete ? 'empty model response' : `generation stopped: ${result.detail}` })
           }
-          if (result.failure !== '') {
-            return reply(502, { ok: false, error: `generation stopped: ${result.failure} (partial output discarded)` })
+          if (!complete) {
+            return reply(502, { ok: false, error: `generation stopped: ${result.detail} (partial output discarded)` })
           }
           return reply(200, { ok: true, text: trimmed })
         } catch (error) {

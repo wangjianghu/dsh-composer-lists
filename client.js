@@ -59,7 +59,7 @@ window.__ModuleLoader__.load({
     // ------------------------------------------------------------------
 
     /** Plugin version, mirrored into package.json — shown in the settings popover title. */
-    const PLUGIN_VERSION = '1.4.0'
+    const PLUGIN_VERSION = '1.4.1'
 
     /** Ordered marker styles: arabic `1.`, letter `a.`, greek `α.`, paren `(1)`, circle `①`. */
     const ORDERED_STYLES = ['arabic', 'letter', 'greek', 'paren', 'circle']

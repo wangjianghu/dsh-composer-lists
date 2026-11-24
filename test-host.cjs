@@ -82,13 +82,16 @@ async function main () {
    * return() calls.
    */
   let providerSeq = 0
-  const useLlm = ({ chunksByCall, resolveInfo, providers, delayMs = 0, onIterator, onClose } = {}) => {
+  const useLlm = ({ chunksByCall, resolveInfo, providers, modelsOf, delayMs = 0, onIterator, onClose } = {}) => {
     calls.length = 0
     providerSeq += 1
     // A distinct provider per test keeps the module-level effort cache from
     // leaking one test's resolution into the next.
     fakeCtx.llm = {
-      listProviders: () => providers ?? [{ provider: `p${providerSeq}`, models: [{ id: 'm' }] }],
+      // Real shapes (dsh-llm 0.2.2): a route is { id, name } and carries NO
+      // model list; its models come from the async listModels(provider).
+      listProviders: () => providers ?? [{ id: `p${providerSeq}`, name: `Provider ${providerSeq}` }],
+      listModels: async (provider) => (modelsOf === undefined ? [{ provider, id: 'm', name: 'Model M' }] : modelsOf(provider)),
       resolveModelInfo: async () => {
         if (resolveInfo instanceof Error) throw resolveInfo
         return resolveInfo
@@ -126,7 +129,7 @@ async function main () {
 
   // 0. Trust fence: a connection rejection short-circuits with its status,
   //    empty body, and no model call.
-  useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '不该出现' }, { type: 'finish', reason: 'stop' }] })
+  useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '不该出现' }, { type: 'finish', reason: { kind: 'stop' } }] })
   {
     nextRejection = 401
     const { res, parsed } = await run({ body: bodyOf(TEXT) })
@@ -142,7 +145,7 @@ async function main () {
     chunksByCall: () => [
       { type: 'text-delta', text: '1. 目标' },
       { type: 'text-delta', text: '\n2. 步骤' },
-      { type: 'finish', reason: 'stop' },
+      { type: 'finish', reason: { kind: 'stop' } },
     ],
     // efforts are declared least → greatest; efforts[0] is the lightest.
     resolveInfo: { reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }] } },
@@ -159,7 +162,7 @@ async function main () {
 
   // 2. Effort resolution cached across requests (fresh provider route).
   useLlm({
-    chunksByCall: () => [{ type: 'text-delta', text: '缓存 内容' }, { type: 'finish', reason: 'stop' }],
+    chunksByCall: () => [{ type: 'text-delta', text: '缓存 内容' }, { type: 'finish', reason: { kind: 'stop' } }],
   })
   {
     let resolves = 0
@@ -172,7 +175,7 @@ async function main () {
 
   // 3. No declared efforts → no effort parameter (provider default).
   useLlm({
-    chunksByCall: () => [{ type: 'text-delta', text: 'ok 内容' }, { type: 'finish', reason: 'stop' }],
+    chunksByCall: () => [{ type: 'text-delta', text: 'ok 内容' }, { type: 'finish', reason: { kind: 'stop' } }],
     resolveInfo: { reasoning: { efforts: [] } },
   })
   {
@@ -183,7 +186,7 @@ async function main () {
 
   // 4. resolveModelInfo throws → omit effort, still succeed; not cached.
   useLlm({
-    chunksByCall: () => [{ type: 'text-delta', text: '好 内容' }, { type: 'finish', reason: 'stop' }],
+    chunksByCall: () => [{ type: 'text-delta', text: '好 内容' }, { type: 'finish', reason: { kind: 'stop' } }],
     resolveInfo: new Error('boom'),
   })
   {
@@ -196,7 +199,7 @@ async function main () {
   useLlm({
     chunksByCall: (n) => n === 1
       ? [{ type: 'finish', reason: { kind: 'max-tokens' } }]
-      : [{ type: 'text-delta', text: '重试 成功' }, { type: 'finish', reason: 'stop' }],
+      : [{ type: 'text-delta', text: '重试 成功' }, { type: 'finish', reason: { kind: 'stop' } }],
   })
   {
     const { res, parsed } = await run({ body: bodyOf(TEXT) })
@@ -224,7 +227,7 @@ async function main () {
   }
 
   // 7a. Every stream call asks for protocol-level tool suppression.
-  useLlm({ chunksByCall: () => [{ type: 'text-delta', text: 'ok 内容' }, { type: 'finish', reason: 'stop' }] })
+  useLlm({ chunksByCall: () => [{ type: 'text-delta', text: 'ok 内容' }, { type: 'finish', reason: { kind: 'stop' } }] })
   {
     await run({ body: bodyOf(TEXT) })
     eq(lastOptions().toolChoice, 'none', 'first call passes toolChoice none')
@@ -233,8 +236,8 @@ async function main () {
   // 7b. tool-calls ending → one nudge retry (same ceiling, appended system), succeeds.
   useLlm({
     chunksByCall: (n) => n === 1
-      ? [{ type: 'finish', reason: 'tool-calls' }]
-      : [{ type: 'text-delta', text: '禁工具 重试成功' }, { type: 'finish', reason: 'stop' }],
+      ? [{ type: 'finish', reason: { kind: 'tool-calls' } }]
+      : [{ type: 'text-delta', text: '禁工具 重试成功' }, { type: 'finish', reason: { kind: 'stop' } }],
   })
   {
     const { res, parsed } = await run({ body: bodyOf(TEXT) })
@@ -248,7 +251,7 @@ async function main () {
   }
 
   // 7c. tool-calls twice → 502 with the descriptive message, no third call.
-  useLlm({ chunksByCall: () => [{ type: 'finish', reason: 'tool-calls' }] })
+  useLlm({ chunksByCall: () => [{ type: 'finish', reason: { kind: 'tool-calls' } }] })
   {
     const { res, parsed } = await run({ body: bodyOf(TEXT) })
     eq(res.status, 502, 'tool-calls twice 502')
@@ -269,7 +272,7 @@ async function main () {
   eq((await run({ method: 'GET', body: '' })).res.status, 405, 'GET 405')
 
   // 9. Cross-origin refused (suffix collision must NOT pass).
-  useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '同源 内容' }, { type: 'finish', reason: 'stop' }] })
+  useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '同源 内容' }, { type: 'finish', reason: { kind: 'stop' } }] })
   {
     const { res } = await run({ headers: { origin: 'http://a.127.0.0.1:9999', host: '127.0.0.1:9999' }, body: bodyOf(TEXT) })
     eq(res.status, 403, 'origin suffix collision refused')
@@ -290,7 +293,7 @@ async function main () {
   // delayed so the close lands between registration and the first chunk.
   useLlm({
     delayMs: 25,
-    chunksByCall: () => [{ type: 'text-delta', text: 'partial' }, { type: 'finish', reason: 'stop' }],
+    chunksByCall: () => [{ type: 'text-delta', text: 'partial' }, { type: 'finish', reason: { kind: 'stop' } }],
   })
   {
     const res = fakeRes()
@@ -310,8 +313,9 @@ async function main () {
 
   // 13. Provider fallback model selection when agentDefaultModel is absent.
   useLlm({
-    chunksByCall: () => [{ type: 'text-delta', text: '回退 模型' }, { type: 'finish', reason: 'stop' }],
-    providers: [{ provider: 'gamma', models: [{ id: 'glm-5' }] }],
+    chunksByCall: () => [{ type: 'text-delta', text: '回退 模型' }, { type: 'finish', reason: { kind: 'stop' } }],
+    providers: [{ id: 'gamma', name: 'Gamma' }],
+    modelsOf: (provider) => [{ provider, id: 'glm-5', name: 'GLM-5' }],
   })
   {
     const { res } = await run({ body: bodyOf(TEXT) })
@@ -345,7 +349,7 @@ async function main () {
     //     on the normal path (the reply is written and the stream closed).
     let returned = 0
     useLlm({
-      chunksByCall: () => [{ type: 'text-delta', text: '正常 内容' }, { type: 'finish', reason: 'stop' }],
+      chunksByCall: () => [{ type: 'text-delta', text: '正常 内容' }, { type: 'finish', reason: { kind: 'stop' } }],
       onClose: () => { returned += 1 },
     })
     {
@@ -360,7 +364,7 @@ async function main () {
     //     cancelled too (not just abandoned), no reply is written.
     useLlm({
       delayMs: 25,
-      chunksByCall: () => [{ type: 'text-delta', text: 'partial' }, { type: 'finish', reason: 'stop' }],
+      chunksByCall: () => [{ type: 'text-delta', text: 'partial' }, { type: 'finish', reason: { kind: 'stop' } }],
       onClose: () => { returned += 1 },
     })
     {
@@ -379,7 +383,7 @@ async function main () {
     //     request and fails the request instead of hanging the handler.
     {
       mock.timers.enable({ apis: ['setTimeout'] })
-      useLlm({ chunksByCall: () => [{ type: 'text-delta', text: 'partial' }, { type: 'finish', reason: 'stop' }], onIterator: () => ({
+      useLlm({ chunksByCall: () => [{ type: 'text-delta', text: 'partial' }, { type: 'finish', reason: { kind: 'stop' } }], onIterator: () => ({
         next: () => new Promise(() => {}), // never resolves: the provider stalled
         return () { returned += 1; return Promise.resolve({ done: true }) },
       }) })
@@ -400,7 +404,7 @@ async function main () {
     {
       let returnedRejecting = 0
       useLlm({
-        chunksByCall: () => [{ type: 'text-delta', text: '好 内容' }, { type: 'finish', reason: 'stop' }],
+        chunksByCall: () => [{ type: 'text-delta', text: '好 内容' }, { type: 'finish', reason: { kind: 'stop' } }],
         onIterator: (inner) => ({
           next: inner.next,
           return () { returnedRejecting += 1; return Promise.reject(new Error('iterator.return() failed (adapter cancel error)')) },
@@ -432,7 +436,7 @@ async function main () {
     useLlm({
       chunksByCall: (n) => n === 1
         ? [{ type: 'text-delta', text: '1. 被截断' }, { type: 'finish', reason: { kind: 'max-tokens' } }]
-        : [{ type: 'text-delta', text: '完整的 重写' }, { type: 'finish', reason: 'stop' }],
+        : [{ type: 'text-delta', text: '完整的 重写' }, { type: 'finish', reason: { kind: 'stop' } }],
     })
     {
       const { res, parsed } = await run({ body: bodyOf(TEXT) })
@@ -454,7 +458,7 @@ async function main () {
     }
 
     // 21. A duplicated Origin header (array form) fails closed.
-    useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '同源 内容' }, { type: 'finish', reason: 'stop' }] })
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '同源 内容' }, { type: 'finish', reason: { kind: 'stop' } }] })
     eq((await run({ headers: { origin: ['http://127.0.0.1:9999', 'http://evil.example'], host: '127.0.0.1:9999' }, body: bodyOf(TEXT) })).res.status, 403, 'array Origin header refused')
 
     // 22. Model-info resolve: a fast rejection clears its 3 s race timer
@@ -468,13 +472,13 @@ async function main () {
       global.setTimeout = (fn, ms, ...rest) => { const id = realSet(fn, ms, ...rest); if (ms === 3000) timers.add(id); return id }
       global.clearTimeout = (id, ...rest) => { cleared.add(id); return realClear(id, ...rest) }
       try {
-        useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '好 内容' }, { type: 'finish', reason: 'stop' }], resolveInfo: new Error('boom') })
+        useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '好 内容' }, { type: 'finish', reason: { kind: 'stop' } }], resolveInfo: new Error('boom') })
         await run({ body: bodyOf(TEXT) })
         ok(timers.size === 1 && cleared.has([...timers][0]), 'fast resolve rejection clears its race timer')
         eq(lastOptions().signal.aborted, false, '(sanity) request completed normally')
         // Concurrent first miss: one shared lookup.
         let resolves = 0
-        useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '并发 内容' }, { type: 'finish', reason: 'stop' }] })
+        useLlm({ chunksByCall: () => [{ type: 'text-delta', text: '并发 内容' }, { type: 'finish', reason: { kind: 'stop' } }] })
         fakeCtx.llm.resolveModelInfo = async () => { resolves += 1; await new Promise((resolve) => realSet(resolve, 20)); return { reasoning: { efforts: [{ id: 'low', name: 'Low' }] } } }
         await Promise.all([run({ body: bodyOf(TEXT) }), run({ body: bodyOf(TEXT) }), run({ body: bodyOf(TEXT) }), run({ body: bodyOf(TEXT) })])
         eq(resolves, 1, 'concurrent first-time requests share one resolveModelInfo')
@@ -486,6 +490,143 @@ async function main () {
     }
   } finally {
     process.off('unhandledRejection', onUnhandled)
+  }
+
+
+  // ==================================================================
+  // 23. The REAL DSH stream protocol (dsh-llm 0.2.2-rc.5). Every stream ends
+  //     with `usage` then `finish`, and the finish reason is an OBJECT keyed
+  //     by `kind` (FinishReasonMap; the pi-ai adapter's mapStopReason yields
+  //     exactly these). 1.4.0 compared the reason with the STRING 'stop' and
+  //     rejected every successful rewrite with "generation stopped: stop
+  //     (partial output discarded)" — the fixtures below are that protocol.
+  // ==================================================================
+  const stop = { type: 'finish', reason: { kind: 'stop' } }
+  const usage = { type: 'usage', usage: { inputTokens: 120, outputTokens: 40 } }
+  {
+    // A complete, successful call, chunk for chunk as the adapter emits it.
+    useLlm({
+      chunksByCall: () => [
+        { type: 'block-start', index: 0, blockType: 'text' },
+        { type: 'text-delta', index: 0, text: '1. 写一份周报' },
+        { type: 'text-delta', index: 0, text: '\n- 包含本周进展' },
+        { type: 'block-end', index: 0, block: { type: 'text', text: '1. 写一份周报\n- 包含本周进展' } },
+        usage,
+        stop,
+      ],
+    })
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq(res.status, 200, 'real protocol: a normal completion succeeds (1.4.0 answered 502 here)')
+    eq(parsed?.text, '1. 写一份周报\n- 包含本周进展', 'real protocol: the rewrite is returned')
+    eq(calls.length, 1, 'real protocol: no retry on a normal completion')
+  }
+  {
+    // A reasoning model: thinking deltas are not part of the rewrite.
+    useLlm({
+      resolveInfo: { reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }] } },
+      chunksByCall: () => [
+        { type: 'block-start', index: 0, blockType: 'reasoning' },
+        { type: 'reasoning-delta', index: 0, text: '先想一下结构……' },
+        { type: 'block-end', index: 0, block: { type: 'reasoning', text: '先想一下结构……' } },
+        { type: 'block-start', index: 1, blockType: 'text' },
+        { type: 'text-delta', index: 1, text: '1. 目标' },
+        usage,
+        stop,
+      ],
+    })
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq([res.status, parsed?.text, lastOptions().reasoningEffort].join(' | '), '200 | 1. 目标 | low', 'real protocol: reasoning deltas stay out, lightest effort still applied')
+  }
+  {
+    // pi-ai mapStopReason: a terminal stop with NO content blocks.
+    useLlm({ chunksByCall: () => [usage, { type: 'finish', reason: { kind: 'error', failure: { message: 'model "glm-5.4" returned a completed response with no content', code: 'EMPTY_RESPONSE' } } }] })
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq(res.status, 502, 'real protocol: empty response is a failure')
+    eq(parsed?.error, 'generation stopped: error: EMPTY_RESPONSE: model "glm-5.4" returned a completed response with no content', 'real protocol: kind + failure code + failure message are shown')
+    eq(calls.length, 1, 'real protocol: an error finish gets no retry')
+  }
+  {
+    // A transport truncation after partial text: the half rewrite is discarded.
+    useLlm({
+      chunksByCall: () => [
+        { type: 'text-delta', index: 0, text: '1. 只写到一半' },
+        usage,
+        { type: 'finish', reason: { kind: 'error', failure: { message: 'Stream ended without finish_reason', code: 'TRANSPORT' } } },
+      ],
+    })
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq([res.status, calls.length].join(' | '), '502 | 1', 'real protocol: truncated output is a failure, no retry')
+    eq(parsed?.error, 'generation stopped: error: TRANSPORT: Stream ended without finish_reason (partial output discarded)', 'real protocol: the transport failure reads clearly')
+    eq(parsed?.text, undefined, 'real protocol: the partial rewrite is not returned')
+  }
+  {
+    // Cancelled upstream (provider aborted, not this handler).
+    useLlm({ chunksByCall: () => [usage, { type: 'finish', reason: { kind: 'aborted', failure: { message: 'pi-ai stream aborted', code: 'ABORTED' } } }] })
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq([res.status, parsed?.error].join(' | '), '502 | generation stopped: aborted: pi-ai stream aborted', 'real protocol: an aborted finish is reported, not retried')
+  }
+  {
+    // Context overflow carries the provider's message.
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', index: 0, text: '1. 被截' }, usage, { type: 'finish', reason: { kind: 'error', failure: { message: 'input length exceeds context window', code: 'CONTEXT_WINDOW_EXCEEDED' } } }] })
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq([res.status, calls.length].join(' | '), '502 | 1', 'real protocol: a context-overflow error is not retried')
+    eq(parsed?.error, 'generation stopped: error: CONTEXT_WINDOW_EXCEEDED: input length exceeds context window (partial output discarded)', 'real protocol: overflow message surfaced')
+  }
+  {
+    // max-tokens (object) → one retry at 8192 → success.
+    useLlm({ chunksByCall: (n) => (n === 1 ? [{ type: 'reasoning-delta', index: 0, text: '思考' }, usage, { type: 'finish', reason: { kind: 'max-tokens' } }] : [{ type: 'text-delta', index: 0, text: '完整 重写' }, usage, stop]) })
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq([res.status, calls.length, calls[1].maxTokens, parsed?.text].join(' | '), '200 | 2 | 8192 | 完整 重写', 'real protocol: max-tokens retries once at the doubled ceiling')
+  }
+  {
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', index: 0, text: '1. 截断' }, usage, { type: 'finish', reason: { kind: 'max-tokens' } }] })
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq([res.status, calls.length].join(' | '), '502 | 2', 'real protocol: max-tokens twice is a failure')
+    eq(parsed?.error, 'generation stopped: max-tokens (partial output discarded)', 'real protocol: truncated twice → reason shown, text withheld')
+  }
+  {
+    // tool-calls (object) → the no-tools nudge retry → success.
+    useLlm({ chunksByCall: (n) => (n === 1 ? [{ type: 'tool-call-delta', index: 0, id: 'c1', name: 'search', argumentsDelta: '{}' }, usage, { type: 'finish', reason: { kind: 'tool-calls' } }] : [{ type: 'text-delta', index: 0, text: '纯文本 重写' }, usage, stop]) })
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq([res.status, calls.length, calls[1].system.includes('不能调用任何工具'), parsed?.text].join(' | '), '200 | 2 | true | 纯文本 重写', 'real protocol: tool-calls gets the no-tools retry')
+  }
+  {
+    // A kind this plugin does not know is never a success.
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', index: 0, text: '1. 某种新结束' }, usage, { type: 'finish', reason: { kind: 'some-future-kind' } }] })
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq([res.status, parsed?.error].join(' | '), '502 | generation stopped: some-future-kind (partial output discarded)', 'real protocol: unknown finish kinds fail closed')
+  }
+  {
+    // An unreadable reason fails closed as well.
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', index: 0, text: '1. 文本' }, { type: 'finish', reason: null }] })
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq([res.status, parsed?.error].join(' | '), '502 | generation stopped: unknown finish reason (partial output discarded)', 'real protocol: a null reason is not a success')
+  }
+  {
+    // A stream that ends without any finish chunk keeps the old contract:
+    // text is accepted, nothing is invented.
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', index: 0, text: '没有 finish 的文本' }] })
+    const { res, parsed } = await run({ body: bodyOf(TEXT) })
+    eq([res.status, parsed?.text].join(' | '), '200 | 没有 finish 的文本', 'real protocol: no finish chunk at all → text is used')
+  }
+  {
+    // String reasons (older adapters) are still understood.
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', index: 0, text: '字符串 原因' }, { type: 'finish', reason: 'stop' }] })
+    const { res } = await run({ body: bodyOf(TEXT) })
+    eq(res.status, 200, 'real protocol: a string "stop" reason still succeeds')
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', index: 0, text: '1. 截断' }, { type: 'finish', reason: 'MAX_TOKENS' }] })
+    const { res: res2 } = await run({ body: bodyOf(TEXT) })
+    eq([res2.status, calls.length].join(' | '), '502 | 2', 'real protocol: a string "MAX_TOKENS" reason is normalized and retried')
+  }
+  {
+    // Fallback model selection uses the real directory API.
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', index: 0, text: '回退 内容' }, usage, stop], providers: [{ id: 'solo', name: 'Solo' }], modelsOf: () => [] })
+    eq((await run({ body: bodyOf(TEXT) })).res.status, 503, 'real protocol: a route with no models answers 503')
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', index: 0, text: '回退 内容' }, usage, stop], providers: [{ id: 'broken', name: 'Broken' }], modelsOf: () => { throw new Error('directory offline') } })
+    eq((await run({ body: bodyOf(TEXT) })).res.status, 503, 'real protocol: a failing model listing answers 503, not a crash')
+    useLlm({ chunksByCall: () => [{ type: 'text-delta', index: 0, text: '回退 内容' }, usage, stop], providers: [{ id: 'gamma', name: 'Gamma' }], modelsOf: (provider) => [{ provider, id: 'glm-5', name: 'GLM-5' }] })
+    const { res } = await run({ body: bodyOf(TEXT) })
+    eq([res.status, lastOptions().provider, lastOptions().model].join(' | '), '200 | gamma | glm-5', 'real protocol: first model of the first route is the fallback')
   }
 
   if (failures > 0) {

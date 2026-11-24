@@ -75,6 +75,6 @@ npm install -g dsh-composer-lists
 # 或在 DSH 工作区内经 plugin_manager install_bundle 安装本仓库目录
 ```
 
-从 1.3.x 升级到 1.4.0 后需要完全退出并重启 DSH（这一版改了 Host 半）。
+升级后（包括从 1.3.x 或 1.4.0 升到 1.4.1）需要完全退出并重启 DSH：Host 半的改动只在重启后生效。
 
 本地开发：克隆后改代码，用 `set_plugin` 停用→启用一次即同步到页面（Host 半改动需重启 DSH）；`node --check client.js index.js && node test-pure.cjs && node test-runtime.cjs && node test-host.cjs` 全绿再提交。

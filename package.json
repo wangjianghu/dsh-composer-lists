@@ -1,6 +1,6 @@
 {
   "name": "dsh-composer-lists",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "type": "module",
   "description": "Ordered and unordered list editing in the DeepSeek Harness composer: auto numbering and renumbering, marker-aware caret moves, level promotion, blank-line flow, and an undoable AI prompt-polish button.",
   "author": "wangjianghu",
